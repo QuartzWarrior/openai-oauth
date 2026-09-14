@@ -6,7 +6,9 @@ export type {
 } from "./auth-file.js"
 export {
 	loadAuthTokens,
+	readAuthInstallationId,
 	resolveAuthFileCandidates,
 	resolveCodexAuthFilePath,
+	saveAuthInstallationId,
 	saveAuthTokens,
 } from "./auth-file.js"

@@ -1,5 +1,6 @@
 import { describe, expect, test, vi } from "vitest"
 import {
+	DEFAULT_CODEX_CLIENT_VERSION,
 	fetchCodexModelCatalog,
 	resetCodexClientVersionCache,
 	resolveCodexClientVersion,
@@ -42,9 +43,9 @@ describe("Codex model catalog", () => {
 			onWarning: (message) => warnings.push(message),
 		})
 
-		expect(version).toBe("0.144.1")
+		expect(version).toBe(DEFAULT_CODEX_CLIENT_VERSION)
 		expect(warnings).toEqual([
-			"Could not determine the latest Codex version. Falling back to 0.144.1. Pass a version explicitly if you need to override it.",
+			`Could not determine the latest Codex version. Falling back to ${DEFAULT_CODEX_CLIENT_VERSION}. Pass a version explicitly if you need to override it.`,
 		])
 	})
 

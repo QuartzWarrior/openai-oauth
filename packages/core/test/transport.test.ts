@@ -1,9 +1,14 @@
 import { afterEach, describe, expect, test, vi } from "vitest"
 import { createOpenAIOAuthTransport } from "../src/index.js"
 import {
+	createOpenAIOAuthRequest,
 	createOpenAIOAuthTransport as createRuntimeOpenAIOAuthTransport,
+	DEFAULT_CODEX_ORIGINATOR,
+	DEFAULT_CODEX_USER_AGENT,
+	exchangeOpenAIOAuthCode,
 	normalizeCodexResponsesBody,
 	type OpenAIOAuthTransportOptions,
+	refreshOpenAIOAuthTokens,
 } from "../src/runtime.js"
 import { collectCompletedResponseFromSse } from "../src/sse.js"
 
@@ -269,7 +274,7 @@ describe("createCodexOAuthFetch", () => {
 		])
 	})
 
-	test("routes FedRAMP sessions without accepting caller header overrides", async () => {
+	test("never forwards x-openai-fedramp (codex-rs emits no such header)", async () => {
 		const fetch = createMockFetch()
 		const oauthFetch = createCodexOAuthFetch({
 			auth: { ...session, isFedRamp: true },
@@ -286,7 +291,10 @@ describe("createCodexOAuthFetch", () => {
 		})
 
 		const [, init] = upstreamCalls(fetch)[0] ?? []
-		expect(new Headers(init?.headers).get("x-openai-fedramp")).toBe("true")
+		// The marker is stripped (never echoed from caller headers either):
+		// codex-rs has no FedRAMP header on the wire, so a "true" stamp would be
+		// a positive non-codex tell.
+		expect(new Headers(init?.headers).get("x-openai-fedramp")).toBeNull()
 	})
 
 	test("preserves absolute codex urls without duplicating the upstream path", async () => {
@@ -634,5 +642,67 @@ describe("collectCompletedResponseFromSse", () => {
 				},
 			],
 		})
+	})
+})
+
+describe("codex OAuth wire surface", () => {
+	test("authorize URL carries codex's scope and originator param", async () => {
+		const request = await createOpenAIOAuthRequest({
+			redirectUri: "http://localhost:1455/auth/callback",
+		})
+		const url = new URL(request.authorizationUrl)
+		// codex's build_authorize_url scope is broader than the OIDC triple.
+		expect(url.searchParams.get("scope")).toBe(
+			"openid profile email offline_access api.connectors.read api.connectors.invoke",
+		)
+		expect(url.searchParams.get("originator")).toBe(DEFAULT_CODEX_ORIGINATOR)
+		expect(url.searchParams.get("response_type")).toBe("code")
+		expect(url.searchParams.get("codex_cli_simplified_flow")).toBe("true")
+	})
+
+	test("authorization-code exchange omits User-Agent and originator (raw auth client)", async () => {
+		const fetch = vi.fn(
+			async () =>
+				new Response(
+					JSON.stringify({ access_token: "tok", refresh_token: "ref" }),
+					{ headers: { "Content-Type": "application/json" } },
+				),
+		)
+		await exchangeOpenAIOAuthCode({
+			code: "code-1",
+			codeVerifier: "verifier-1",
+			redirectUri: "http://localhost:1455/auth/callback",
+			fetch: fetch as never,
+		})
+		const [, init] = fetch.mock.calls[0] ?? []
+		const headers = new Headers(init?.headers)
+		// Genuine CLI uses create_raw_auth_client for the code exchange: a bare
+		// client with no codex default headers at all.
+		expect(headers.get("user-agent")).toBeNull()
+		expect(headers.get("originator")).toBeNull()
+		expect(headers.get("content-type")).toBe(
+			"application/x-www-form-urlencoded",
+		)
+	})
+
+	test("refresh token request stamps codex User-Agent and originator (default auth client)", async () => {
+		const fetch = vi.fn(
+			async () =>
+				new Response(
+					JSON.stringify({ access_token: "tok", refresh_token: "ref" }),
+					{ headers: { "Content-Type": "application/json" } },
+				),
+		)
+		await refreshOpenAIOAuthTokens({
+			refreshToken: "ref",
+			fetch: fetch as never,
+		})
+		const [, init] = fetch.mock.calls[0] ?? []
+		const headers = new Headers(init?.headers)
+		// Genuine CLI uses create_default_auth_client for refresh: codex default
+		// headers (User-Agent + originator) are present.
+		expect(headers.get("user-agent")).toBe(DEFAULT_CODEX_USER_AGENT)
+		expect(headers.get("originator")).toBe(DEFAULT_CODEX_ORIGINATOR)
+		expect(headers.get("content-type")).toBe("application/json")
 	})
 })

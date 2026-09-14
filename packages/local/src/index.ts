@@ -9,6 +9,14 @@ import {
 	loadAuthTokens,
 } from "./auth-file.js"
 
+export {
+	readAuthInstallationId,
+	resolveAuthFileCandidates,
+	resolveCodexAuthFilePath,
+	saveAuthInstallationId,
+	saveAuthTokens,
+} from "./auth-file.js"
+
 export type LocalOpenAIOAuthOptions = Omit<AuthLoaderOptions, "fetch"> & {
 	fetch?: FetchFunction
 	baseURL?: string

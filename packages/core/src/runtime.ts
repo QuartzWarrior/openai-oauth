@@ -1,19 +1,114 @@
 import { CODEX_IMAGE_MODEL, prepareCodexImageRequest } from "./images.js"
 import {
 	type CodexModelInfo,
+	DEFAULT_CODEX_CLIENT_VERSION,
 	fetchCodexModelCatalog,
 	isPublicCodexModel,
+	resolveCodexClientVersion,
 } from "./models.js"
 import { collectCompletedResponseFromSse } from "./sse.js"
 import { CodexResponsesState } from "./state.js"
-import { isRecord } from "./utils.js"
+import { isRecord, randomUUIDv7 } from "./utils.js"
 
 export const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
+export const DEFAULT_CODEX_ORIGINATOR = "codex_cli_rs"
+
+const CODEX_UA_KERNEL = "6.8.0-79-generic"
+const CODEX_UA_ARCH = "x86_64"
+
+/**
+ * Terminal tokens codex_terminal_detection can genuinely produce for a process
+ * running on a headless Linux host — and only those. Anything mac/Windows-only
+ * (iTerm.app, Apple_Terminal, WarpTerminal, WindowsTerminal) or GUI-detached
+ * (Ghostty, Alacritty, Konsole, gnome-terminal, VTE) is excluded because a
+ * Linux server-side codex could never emit them. Each entry is one a real
+ * codex TUI/exec could legitimately stamp on this box:
+ *  - unknown             — TUI with no TTY, piped, or TERM unset (dominant)
+ *  - xterm-256color/tmux/screen — TUI inside tmux/screen/tmux-in-xterm
+ *  - kitty               — `kitty +kitten ssh` (no version in the token)
+ *  - WezTerm/<build>     — wezterm SSH-domain client
+ *  - vscode/<ver>        — `code tunnel` / vscode-server (TERM_PROGRAM=vscode)
+ * Weighted toward the headless majority: unknown + multiplexer dominate.
+ */
+const LEGIT_TERMINAL_TOKENS: ReadonlyArray<{ token: string; weight: number }> =
+	[
+		{ token: "unknown", weight: 44 },
+		{ token: "unknown", weight: 16 }, // ~60% unknown overall
+		{ token: "xterm-256color", weight: 8 },
+		{ token: "screen", weight: 4 },
+		{ token: "screen-256color", weight: 6 },
+		{ token: "tmux-256color", weight: 4 },
+		{ token: "kitty", weight: 6 },
+		{ token: "WezTerm/20240203-110809-5046fc22", weight: 4 },
+		{ token: "vscode/1.104.0", weight: 8 },
+	]
+
+const TOTAL_TOKEN_WEIGHT = LEGIT_TERMINAL_TOKENS.reduce(
+	(sum, entry) => sum + entry.weight,
+	0,
+)
+
+/** Deterministic 32-bit hash for pinning a terminal token per account. */
+const hashTerminalSeed = (seed: string): number => {
+	let h = 0x811c9dc5
+	for (let i = 0; i < seed.length; i += 1) {
+		h ^= seed.charCodeAt(i)
+		h = Math.imul(h, 0x01000193)
+	}
+	return h >>> 0
+}
+
+/**
+ * Picks a stable, legit terminal token for the given seed (typically an
+ * installation id). Same seed always yields the same token, so one account
+ * keeps one UA forever. Crate-recognized tokens are emitted exactly as codex
+ * would (`kitty` bare, WezTerm with its build number, vscode with a version).
+ */
+export const pickCodexTerminalToken = (seed: string): string => {
+	const roll = hashTerminalSeed(seed) % TOTAL_TOKEN_WEIGHT
+	let acc = 0
+	for (const entry of LEGIT_TERMINAL_TOKENS) {
+		acc += entry.weight
+		if (roll < acc) {
+			return entry.token
+		}
+	}
+	return "unknown"
+}
+
+/**
+ * Builds the User-Agent Codex CLI stamps on every backend request
+ * (codex-rs login/src/auth/default_client.rs `get_codex_user_agent`):
+ * `<originator>/<version> (<os> <os-version>; <arch>) <terminal-ua>`.
+ *
+ * The terminal token defaults to `unknown` — verified against a live codex
+ * 0.154 capture as the token a TUI emits with no real terminal, which is what
+ * a headless pool genuinely is. Pass `terminalToken` (e.g. from
+ * `pickCodexTerminalToken`) to give one account a stable, legitimately-
+ * possible token instead. The os-version segment is a Linux kernel release
+ * string (`uname -r`), what `os_info::version()` returns on the Linux hosts
+ * Codex runs on. `settings.headers["User-Agent"]` always overrides.
+ */
+export const buildCodexUserAgent = (
+	codexVersion: string,
+	terminalToken = "unknown",
+): string =>
+	`${DEFAULT_CODEX_ORIGINATOR}/${codexVersion} (Linux ${CODEX_UA_KERNEL}; ${CODEX_UA_ARCH}) ${terminalToken}`
+/**
+ * Fallback User-Agent built from the pinned default client version; mirrors
+ * the exact shape `buildCodexUserAgent` produces once the version resolves.
+ */
+export const DEFAULT_CODEX_USER_AGENT = buildCodexUserAgent(
+	DEFAULT_CODEX_CLIENT_VERSION,
+)
 export const DEFAULT_OPENAI_COMPATIBLE_BASE_URL =
 	"https://openai-oauth.local/v1"
 export const DEFAULT_OPENAI_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 export const DEFAULT_OPENAI_OAUTH_ISSUER = "https://auth.openai.com"
-export const DEFAULT_OPENAI_OAUTH_SCOPE = "openid profile email offline_access"
+// Codex's authorize scope is broader than the plain OIDC triple — it also
+// requests the connectors scopes (login/server.rs build_authorize_url).
+export const DEFAULT_OPENAI_OAUTH_SCOPE =
+	"openid profile email offline_access api.connectors.read api.connectors.invoke"
 const DEFAULT_CODEX_INSTRUCTIONS = ""
 const MODEL_CATALOG_TTL_MS = 5 * 60 * 1000
 const MODEL_CATALOG_FAILURE_TTL_MS = 60 * 1000
@@ -60,6 +155,8 @@ export type OpenAIOAuthRequestOptions = {
 	codeVerifier?: string
 	simplifiedFlow?: boolean
 	idTokenAddOrganizations?: boolean
+	/** `originator` query param on the authorize URL (defaults to codex's). */
+	originator?: string
 	extraParams?: Record<string, string | number | boolean | undefined>
 }
 
@@ -99,6 +196,14 @@ export type RefreshOpenAIOAuthTokensOptions = {
 	tokenUrl?: string
 	fetch?: FetchFunction
 	signal?: AbortSignal
+	/**
+	 * Full User-Agent for the refresh request, e.g. the account's data-path UA
+	 * (`buildCodexUserAgent(resolvedVersion, terminalToken)`). Codex uses one
+	 * process-wide UA (`create_default_auth_client`), so a pool refresh must
+	 * match that account's /responses+models UA exactly. Defaults to the pinned
+	 * `DEFAULT_CODEX_USER_AGENT` (pinned version, `unknown` token).
+	 */
+	userAgent?: string
 }
 
 type CodexOAuthRuntimeSettings = {
@@ -109,6 +214,13 @@ type CodexOAuthRuntimeSettings = {
 	headers?: Record<string, string>
 	instructions?: string
 	responsesState?: CodexResponsesState | false
+	/**
+	 * Override the default `unknown` terminal token in the Codex User-Agent.
+	 * Must be a legitimately-possible value for a headless Linux codex (see
+	 * `pickCodexTerminalToken`); never a mac/Windows-only program. Pools pin one
+	 * per account; `settings.headers["User-Agent"]` still overrides everything.
+	 */
+	terminalToken?: string
 }
 
 export type OpenAIOAuthTransportOptions = Omit<
@@ -116,7 +228,14 @@ export type OpenAIOAuthTransportOptions = Omit<
 	"responsesState"
 > & {
 	openAIBaseURL?: string
-	responsesState?: false
+	/**
+	 * `false` disables the Responses-state cache entirely. Passing a
+	 * `CodexResponsesState` instance pins the cache the transport mirrors
+	 * `previous_response_id` chains into — a pool uses this to give each account
+	 * its own device-local cache so a chain never resolves across accounts.
+	 * Omitted: the transport owns a private cache.
+	 */
+	responsesState?: CodexResponsesState | false
 }
 
 export type OpenAIOAuthTransport = {
@@ -319,20 +438,37 @@ const requestOpenAIOAuthTokens = async (options: {
 	tokenUrl?: string
 	fetch?: FetchFunction
 	signal?: AbortSignal
+	/** Sent verbatim as the User-Agent header. Pass `null` to omit the header. */
+	userAgent?: string | null
+	/** Sent as codex's `originator` header when provided. */
+	originator?: string
 	body: Record<string, string>
 	encoding: "form" | "json"
 }): Promise<OpenAIOAuthTokenResponse> => {
 	const issuer = options.issuer ?? DEFAULT_OPENAI_OAUTH_ISSUER
 	const isForm = options.encoding === "form"
+	// Codex splits its OAuth surface by client: the authorization-code exchange
+	// and the API-key exchange use `create_raw_auth_client`, a bare reqwest
+	// builder with no codex default headers (no User-Agent, no originator),
+	// while the refresh flow uses `create_default_auth_client`, which stamps the
+	// codex User-Agent + originator (login/default_client.rs default_headers).
+	// Callers pass exactly the surface the genuine CLI emits for that request.
+	const headers: Record<string, string> = {
+		"Content-Type": isForm
+			? "application/x-www-form-urlencoded"
+			: "application/json",
+	}
+	if (options.userAgent != null) {
+		headers["User-Agent"] = options.userAgent
+	}
+	if (options.originator !== undefined) {
+		headers.originator = options.originator
+	}
 	const response = await pickFetch(options.fetch)(
 		resolveTokenUrl(issuer, options.tokenUrl),
 		{
 			method: "POST",
-			headers: {
-				"Content-Type": isForm
-					? "application/x-www-form-urlencoded"
-					: "application/json",
-			},
+			headers,
 			body: isForm
 				? new URLSearchParams(options.body).toString()
 				: JSON.stringify(options.body),
@@ -401,7 +537,17 @@ export const createOpenAIOAuthRequest = async (
 		authorizationUrl.searchParams.set("codex_cli_simplified_flow", "true")
 	}
 
+	// The genuine CLI's authorize URL always carries an `originator` query param
+	// (login/server.rs build_authorize_url) defaulting to `codex_cli_rs` —
+	// omitting it marks the login flow as non-codex.
+	authorizationUrl.searchParams.set(
+		"originator",
+		options.originator ?? DEFAULT_CODEX_ORIGINATOR,
+	)
+
 	for (const [key, value] of Object.entries(options.extraParams ?? {})) {
+		// `originator` is owned by the dedicated option above (codex always
+		// stamps its own); extraParams must not clobber it.
 		if (value !== undefined && key !== "originator") {
 			authorizationUrl.searchParams.set(key, String(value))
 		}
@@ -424,6 +570,9 @@ export const exchangeOpenAIOAuthCode = (
 		tokenUrl: options.tokenUrl,
 		fetch: options.fetch,
 		signal: options.signal,
+		// Codex exchanges the authorization code with `create_raw_auth_client`:
+		// a bare client with NO codex User-Agent and NO originator header.
+		userAgent: null,
 		encoding: "form",
 		body: {
 			grant_type: "authorization_code",
@@ -442,6 +591,12 @@ export const refreshOpenAIOAuthTokens = (
 		tokenUrl: options.tokenUrl,
 		fetch: options.fetch,
 		signal: options.signal,
+		// Codex refreshes with `create_default_auth_client`, which stamps the
+		// codex User-Agent + originator on the token request — the same process-wide
+		// UA as the data path. A pool passes its account's UA; a bare client keeps
+		// the pinned default.
+		userAgent: options.userAgent ?? DEFAULT_CODEX_USER_AGENT,
+		originator: DEFAULT_CODEX_ORIGINATOR,
 		encoding: "json",
 		body: {
 			grant_type: "refresh_token",
@@ -581,6 +736,14 @@ const applyModelDefaults = (
 	normalized: Record<string, unknown>,
 	modelInfo: CodexModelInfo | undefined,
 ): void => {
+	// Codex's ResponsesApiRequest always serializes tool_choice:"auto" and a
+	// boolean parallel_tool_calls (client.rs:886-887), regardless of model.
+	// Their absence lets the server default them, but a genuine codex body
+	// always carries both, so stamp them when the caller left them unset.
+	if (normalized.tool_choice === undefined) {
+		normalized.tool_choice = "auto"
+	}
+
 	if (!modelInfo) {
 		return
 	}
@@ -610,6 +773,13 @@ const applyModelDefaults = (
 	}
 
 	if (!modelInfo.useResponsesLite) {
+		// Non-Lite: codex sends parallel_tool_calls = prompt.parallel_tool_calls &&
+		// !lite, so a caller's explicit value is honored; only stamp the codex
+		// default (false) when the caller left it unset. The Lite branch below
+		// forces it false, so it must not be touched here.
+		if (normalized.parallel_tool_calls === undefined) {
+			normalized.parallel_tool_calls = false
+		}
 		return
 	}
 
@@ -636,6 +806,8 @@ const applyModelDefaults = (
 
 	normalized.input = [...prefix, ...input]
 	normalized.instructions = ""
+	// Lite: codex computes parallel_tool_calls = prompt.parallel_tool_calls &&
+	// !use_responses_lite, which is always false on this path — force it.
 	normalized.parallel_tool_calls = false
 	delete normalized.tools
 }
@@ -732,6 +904,85 @@ const prepareResponsesRequestBody = async (
 			headers.set(RESPONSES_LITE_HEADER, "true")
 		}
 
+		// Codex ties prompt-cache affinity to the session id twice: the
+		// `session-id` header and an identical `prompt_cache_key` in the body
+		// (codex.rs prompt_cache_key() = responses_session_id). With no session
+		// id at all it still always sends one (its thread id), so stamp a fresh
+		// UUID as the single missing conversation identity.
+		const sessionId = headers.get("session-id")
+		if (sessionId !== null && normalized.prompt_cache_key === undefined) {
+			normalized.prompt_cache_key = sessionId
+		}
+		// Root-session parity (core/src/session/session.rs:892 — "session_id is
+		// equal to the root thread's ID"): a caller-provided session id without a
+		// thread id means thread-id == session-id, and codex still stamps
+		// thread-id/x-client-request-id/x-codex-window-id on the request.
+		if (headers.get("thread-id") === null && sessionId !== null) {
+			headers.set("thread-id", sessionId)
+			headers.set("x-client-request-id", sessionId)
+			headers.set("x-codex-window-id", `${sessionId}:0`)
+		}
+		if (sessionId === null) {
+			// Time-ordered v7 like every other codex-issued thread/session id
+			// (protocol/src/items.rs) — a v4 here reads generationally wrong.
+			const minted = randomUUIDv7()
+			headers.set("session-id", minted)
+			headers.set("thread-id", minted)
+			headers.set("x-client-request-id", minted)
+			// compatibility_headers() stamps x-codex-window-id on every /responses
+			// request; a SDK passthrough has one window, codex's ":0".
+			headers.set("x-codex-window-id", `${minted}:0`)
+			if (normalized.prompt_cache_key === undefined) {
+				normalized.prompt_cache_key = minted
+			}
+		}
+
+		// Codex sends the conversation identity block on every /responses body
+		// (CodexResponsesMetadata::client_metadata): installation id + session,
+		// thread and window ids. Send only ids we know are real — never
+		// fabricate an installation id here (a minted "device" inconsistent with
+		// the account's registry state is worse than the older-client absence).
+		if (normalized.client_metadata === undefined) {
+			const installationId =
+				settings.headers?.["x-codex-installation-id"] ??
+				settings.headers?.installation_id
+			const metadata: Record<string, string> = {}
+			if (sessionId !== null) {
+				metadata.session_id = sessionId
+			}
+			const threadId = headers.get("thread-id")
+			if (threadId !== null) {
+				metadata.thread_id = threadId
+			}
+			if (installationId !== undefined) {
+				metadata["x-codex-installation-id"] = installationId
+			}
+			// window_id is non-optional in codex's client_metadata and takes the
+			// form "<thread_id>:<window_number>". An explicit caller/config value
+			// wins; otherwise derive it from the thread id as codex's first (only)
+			// window ":0" so the block matches codex's always-present shape.
+			const configuredWindowId =
+				settings.headers?.["x-codex-window-id"] ?? settings.headers?.window_id
+			const derivedWindowId =
+				configuredWindowId ?? (threadId !== null ? `${threadId}:0` : undefined)
+			if (derivedWindowId !== undefined) {
+				metadata["x-codex-window-id"] = derivedWindowId
+			}
+			// codex mints a fresh v7 turn_id per turn and ships it here when the
+			// request is turn-shaped (turn_metadata.rs:136 → client_metadata
+			// responses_metadata.rs:325-327). Emit it only under caller pin: bare
+			// consumers sending a fresh turn_id per HTTP request read as many
+			// distinct turns, where one device should keep a coherent turn id
+			// for the conversation.
+			const pinnedTurnId = settings.headers?.turn_id
+			if (pinnedTurnId !== undefined) {
+				metadata.turn_id = pinnedTurnId
+			}
+			if (Object.keys(metadata).length > 0) {
+				normalized.client_metadata = metadata
+			}
+		}
+
 		if (state?.requiresCachedState(normalized)) {
 			await state.waitForPendingCaptures()
 		}
@@ -808,7 +1059,12 @@ const finalizeResponsesResponse = async (
 	})
 }
 
-const applyAuthHeaders = (headers: Headers, auth: OpenAIOAuthSession): void => {
+const applyAuthHeaders = (
+	headers: Headers,
+	auth: OpenAIOAuthSession,
+	codexVersion?: string,
+	terminalToken?: string,
+): void => {
 	headers.delete("authorization")
 	headers.delete("chatgpt-account-id")
 	headers.delete("openai-beta")
@@ -817,12 +1073,37 @@ const applyAuthHeaders = (headers: Headers, auth: OpenAIOAuthSession): void => {
 	headers.set("Authorization", `Bearer ${auth.accessToken}`)
 	headers.set("chatgpt-account-id", auth.accountId)
 
-	const isFedRamp =
-		auth.isFedRamp ??
-		(deriveChatGptAccountIsFedRamp(auth.idToken) ||
-			deriveChatGptAccountIsFedRamp(auth.accessToken))
-	if (isFedRamp) {
-		headers.set("X-OpenAI-Fedramp", "true")
+	// Codex's default client stamps `originator` + a codex-flavored User-Agent
+	// on every request (codex-rs default_client.rs default_headers). The
+	// X-OpenAI-Fedramp marker is deliberately NOT forwarded: codex-rs never
+	// emits it, so sending it flags the request as non-codex.
+	// Set only when not already present so overrides via settings.headers win.
+	if (!headers.has("originator")) {
+		headers.set("originator", DEFAULT_CODEX_ORIGINATOR)
+	}
+	if (!headers.has("user-agent")) {
+		headers.set(
+			"User-Agent",
+			codexVersion
+				? buildCodexUserAgent(codexVersion, terminalToken)
+				: DEFAULT_CODEX_USER_AGENT,
+		)
+	}
+	// Codex negotiates SSE only on /responses (endpoint/responses.rs sets
+	// ACCEPT: text/event-stream per-request, inside the responses stream path).
+	// It is deliberately NOT set here: this helper also serves /models and other
+	// non-streaming calls, where codex sends no explicit Accept. The /responses
+	// path stamps it explicitly before dispatch.
+	const sessionId = headers.get("session-id")
+	if (sessionId) {
+		// Codex derives prompt-cache affinity from session-id and mirrors the
+		// thread id in both thread-id and x-client-request-id.
+		if (!headers.has("thread-id")) {
+			headers.set("thread-id", sessionId)
+		}
+		if (!headers.has("x-client-request-id")) {
+			headers.set("x-client-request-id", sessionId)
+		}
 	}
 }
 
@@ -855,7 +1136,12 @@ const createModelCatalogResolver = (
 								new Headers(init?.headers).forEach((value, key) => {
 									headers.set(key, value)
 								})
-								applyAuthHeaders(headers, auth)
+								applyAuthHeaders(
+									headers,
+									auth,
+									undefined,
+									settings.terminalToken,
+								)
 								return fetch(
 									new URL(path.replace(/^\//, ""), `${baseURL}/`).toString(),
 									{
@@ -867,8 +1153,15 @@ const createModelCatalogResolver = (
 							},
 						},
 						{
+							// The registry version lookup is unauthenticated
+							// metadata about the Codex CLI package. Honoring a
+							// caller-supplied fetch first keeps server-side behaviour
+							// (e.g. openai-oauth test/server handlers) intact; in the
+							// default Node runtime there is no custom fetch, so we
+							// must not let this unauthenticated lookup ride an
+							// auth-proxied account fetch.
+							fetchImpl: settings.fetch ?? globalThis.fetch?.bind(globalThis),
 							codexVersion: settings.codexVersion,
-							fetchImpl: fetch,
 						},
 					)
 					const result = { models }
@@ -929,12 +1222,35 @@ const createCodexOAuthFetch = (
 		(await resolveModelCatalog(auth)).models.find(
 			(entry) => entry.slug === model,
 		)
+	// Resolved once (mirrors the npm-registry lookup the model catalog already
+	// performs) and stamped onto the default Codex User-Agent from then on.
+	// Pre-resolution requests keep the pinned fallback UA; a literal
+	// settings.headers["User-Agent"] always wins over both.
+	let resolvedCodexVersion: string | undefined
+	let codexVersionPromise: Promise<string> | undefined
+	const resolveUserAgentVersion = (): Promise<string> => {
+		codexVersionPromise ??= resolveCodexClientVersion({
+			codexVersion: settings.codexVersion,
+			fetchImpl: settings.fetch ?? globalThis.fetch?.bind(globalThis),
+		})
+			.then((version) => {
+				resolvedCodexVersion = version
+				return version
+			})
+			.catch(() => {
+				resolvedCodexVersion = DEFAULT_CODEX_CLIENT_VERSION
+				return resolvedCodexVersion
+			})
+		return codexVersionPromise
+	}
 
 	return async (input, init) => {
 		const request = await readRequestParts(input, init)
 		const targetUrl = resolveTargetUrl(request.url, baseURL)
 		const target = new URL(targetUrl)
 		const auth = await resolveAuth(settings.auth)
+		const userAgentResolution =
+			resolvedCodexVersion !== undefined ? undefined : resolveUserAgentVersion()
 		if (
 			(request.method ?? "GET").toUpperCase() === "GET" &&
 			target.pathname.endsWith("/models") &&
@@ -980,7 +1296,50 @@ const createCodexOAuthFetch = (
 		request.headers.forEach((value, key) => {
 			headers.set(key, value)
 		})
-		applyAuthHeaders(headers, auth)
+		// Codex CLI sends one `session-id` per conversation (the thread id used
+		// for prompt-cache affinity). The settings-level session id is only a
+		// fallback device identity for pools that don't already stamp a
+		// conversation-scoped `session-id` per request; any per-request value
+		// merged above always wins. Underscore `session_id` is a settings-side
+		// configuration key, never sent verbatim.
+		const configuredSessionId =
+			settings.headers?.session_id ?? settings.headers?.["session-id"]
+		if (configuredSessionId !== undefined) {
+			headers.delete("session_id")
+			if (!headers.has("session-id")) {
+				headers.set("session-id", configuredSessionId)
+			}
+		}
+		// Underscore installation_id is a settings-side key too: it belongs only
+		// in the body's client_metadata (added in prepareResponsesRequestBody),
+		// never as a literal request header.
+		headers.delete("installation_id")
+		// Await the one-time version resolution so the first request already
+		// stamps the fully-resolved UA (originator + version + per-account
+		// terminalToken) instead of the build-frozen DEFAULT_CODEX_USER_AGENT —
+		// which would otherwise drop terminalToken on the fallback path.
+		await userAgentResolution
+		applyAuthHeaders(
+			headers,
+			auth,
+			resolvedCodexVersion,
+			settings.terminalToken,
+		)
+		// Codex's built-in OpenAI provider carries a static `version` header set to
+		// its build version on every request (model-provider-info/src/lib.rs:474
+		// http_headers → applied to /responses, /models, ws, everything). Matches
+		// the UA's version segment — never let it float off resolvedCodexVersion.
+		if (!headers.has("version")) {
+			headers.set(
+				"version",
+				resolvedCodexVersion ?? DEFAULT_CODEX_CLIENT_VERSION,
+			)
+		}
+		// Codex sets Accept: text/event-stream only on the /responses streaming
+		// endpoint; /models and image calls get no explicit Accept header.
+		if (target.pathname.endsWith("/responses") && !headers.has("accept")) {
+			headers.set("Accept", "text/event-stream")
+		}
 		const preparedImage = await prepareCodexImageRequest(
 			target.pathname,
 			headers,

@@ -132,6 +132,17 @@ export class CodexResponsesState {
 			return nextBody
 		}
 
+		if (previousResponseId != null) {
+			// Not one of this device's own chain heads: a foreign
+			// `previous_response_id` (e.g. a different pool account's). Codex would
+			// answer `previous_response_not_found` and resend the full input with
+			// no chain — replicate that offline so the wire never sees a chain this
+			// account didn't manufacture.
+			nextBody.input = [...(Array.isArray(directInput) ? directInput : [])]
+			delete nextBody.previous_response_id
+			return nextBody
+		}
+
 		if (Array.isArray(directInput)) {
 			nextBody.input = directInput
 		}

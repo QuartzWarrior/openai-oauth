@@ -13,6 +13,30 @@ import {
 const AUTH_FILENAME = "auth.json"
 const REFRESH_EXPIRY_MARGIN_MS = 5 * 60 * 1000
 const REFRESH_INTERVAL_MS = 55 * 60 * 1000
+const UUID_V4_RE =
+	/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+/**
+ * Codex persists its installation id in a standalone `installation_id` file in
+ * the codex home dir (default `~/.codex`). When real codex shares the machine,
+ * reusing that exact id keeps the pool indistinguishable from the genuine CLI.
+ * Read-only here: we never create the file when it does not already exist.
+ * Returns undefined unless the file holds a bare v4 UUID.
+ */
+const readCodexNativeInstallationId = async (): Promise<string | undefined> => {
+	try {
+		const codexHome =
+			process.env.CODEX_HOME ?? path.join(os.homedir(), ".codex")
+		const raw = await fs.readFile(
+			path.join(codexHome, "installation_id"),
+			"utf8",
+		)
+		const value = raw.trim()
+		return UUID_V4_RE.test(value) ? value : undefined
+	} catch {
+		return undefined
+	}
+}
 
 type StoredTokens = {
 	id_token?: string
@@ -26,6 +50,12 @@ type AuthFile = {
 	OPENAI_API_KEY?: string
 	tokens?: StoredTokens
 	last_refresh?: string
+	/**
+	 * Stable device/installation identity Codex CLI reports in
+	 * `x-codex-installation-id` and websocket `client_metadata`. Persisted here
+	 * so a pool account keeps one installation id across restarts.
+	 */
+	installation_id?: string
 }
 
 export type EffectiveAuth = {
@@ -46,6 +76,15 @@ export type AuthLoaderOptions = {
 	fetch: FetchFunction
 	ensureFresh?: boolean
 	now?: () => Date
+	/**
+	 * Full User-Agent for the token-refresh request. One codex process uses a
+	 * single process-wide UA everywhere (refresh + /responses + /models), so a
+	 * pool passes its account's data-path UA here to keep them identical;
+	 * omitted = the pinned default codex UA (pinned version, `unknown` token).
+	 * A function is awaited lazily at each refresh so the version segment always
+	 * reflects the UA the data path would stamp that moment.
+	 */
+	userAgent?: string | (() => string | Promise<string>)
 }
 
 export type SaveAuthTokensOptions = {
@@ -238,6 +277,9 @@ const writeAuthFile = async (
 		encoding: "utf-8",
 		mode: 0o600,
 	})
+	// writeFile's mode applies only at creation; codex enforces 0o600 on
+	// existing files too, so lock the file down regardless of prior state.
+	await fs.chmod(filePath, 0o600).catch(() => {})
 }
 
 export const resolveCodexAuthFilePath = (authFilePath?: string): string => {
@@ -296,19 +338,75 @@ export const saveAuthTokens = async (
 	}
 }
 
+/**
+ * Resolves the installation id Codex CLI reports in `x-codex-installation-id`
+ * and websocket `client_metadata`. Preference order mirrors codex itself: the
+ * standalone codex-native `installation_id` file wins when the caller opts to
+ * share the genuine CLI's identity; otherwise the id persisted in auth.json.
+ */
+const resolveInstallationId = (
+	authFileValue: unknown,
+	nativeValue: string | undefined,
+): string | undefined => {
+	if (nativeValue) {
+		return nativeValue
+	}
+	return typeof authFileValue === "string" && authFileValue.length > 0
+		? authFileValue
+		: undefined
+}
+
+/**
+ * Reads the persisted installation id, if any. By default this is the id in
+ * auth.json (per-account, so pool accounts stay isolated). Codex's native
+ * `~/.codex/installation_id` is consulted only when `options.preferNative` is
+ * set — that file identifies the genuine CLI on this machine, so it should be
+ * claimed by at most one account. Returns undefined when no usable id exists.
+ */
+export const readAuthInstallationId = async (
+	authFilePath: string,
+	options?: { preferNative?: boolean },
+): Promise<string | undefined> => {
+	const { data } = await readAuthFile([authFilePath])
+	return resolveInstallationId(
+		data?.installation_id,
+		options?.preferNative ? await readCodexNativeInstallationId() : undefined,
+	)
+}
+
+/**
+ * Persists an installation id into auth.json, preserving every existing field
+ * (tokens, auth_mode, last_refresh, unknown keys) and the 0o600 file mode
+ * `writeAuthFile` enforces.
+ */
+export const saveAuthInstallationId = async (
+	authFilePath: string,
+	installationId: string,
+): Promise<void> => {
+	const existing = (await readAuthFile([authFilePath])).data ?? {}
+	await writeAuthFile(authFilePath, {
+		...existing,
+		installation_id: installationId,
+	})
+}
+
 const refreshChatGptTokens = async (
 	refreshToken: string,
 	clientId: string | undefined,
 	issuer: string | undefined,
 	tokenUrl: string | undefined,
 	fetchFn: FetchFunction,
+	userAgent?: string | (() => string | Promise<string>),
 ): Promise<RefreshOutcome> => {
+	const resolvedUserAgent =
+		typeof userAgent === "function" ? await userAgent() : userAgent
 	const refreshed = await refreshOpenAIOAuthTokens({
 		refreshToken,
 		clientId,
 		issuer,
 		tokenUrl,
 		fetch: fetchFn,
+		userAgent: resolvedUserAgent,
 	})
 
 	return {
@@ -343,6 +441,7 @@ export const loadAuthTokens = async (
 		fetch,
 		ensureFresh = true,
 		now = () => new Date(),
+		userAgent,
 	} = options
 
 	if (typeof fetch !== "function") {
@@ -376,6 +475,7 @@ export const loadAuthTokens = async (
 			issuer,
 			tokenUrl,
 			fetch,
+			userAgent,
 		)
 
 		accessToken = refreshed.accessToken

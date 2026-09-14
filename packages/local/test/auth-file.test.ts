@@ -80,8 +80,9 @@ describe("auth helpers", () => {
 		expect(url.searchParams.get("redirect_uri")).toBe(
 			"http://127.0.0.1:1234/auth/callback",
 		)
+		// Codex's authorize scope is broader than the plain OIDC triple.
 		expect(url.searchParams.get("scope")).toBe(
-			"openid profile email offline_access",
+			"openid profile email offline_access api.connectors.read api.connectors.invoke",
 		)
 		expect(url.searchParams.get("code_challenge")).toBe(
 			createHash("sha256").update("verifier-1").digest("base64url"),
@@ -89,7 +90,9 @@ describe("auth helpers", () => {
 		expect(url.searchParams.get("code_challenge_method")).toBe("S256")
 		expect(url.searchParams.get("codex_cli_simplified_flow")).toBe("true")
 		expect(url.searchParams.get("id_token_add_organizations")).toBe("true")
-		expect(url.searchParams.has("originator")).toBe(false)
+		// Codex always sends an originator param (default codex_cli_rs); the
+		// extraParams value does not override it.
+		expect(url.searchParams.get("originator")).toBe("codex_cli_rs")
 	})
 
 	test("exchangeOpenAIOAuthCode sends authorization_code token request", async () => {
