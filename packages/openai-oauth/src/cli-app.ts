@@ -92,7 +92,7 @@ const helpLines = [
 	"  --base-url <url>           Override the upstream Codex base URL.",
 	"  --oauth-client-id <id>     Override the OAuth client id used for refresh.",
 	"  --oauth-token-url <url>    Override the OAuth token URL used for refresh.",
-	"  --oauth-file <path>        Path to the local auth.json file.",
+	"  --oauth-file <path>        Path to the local auth.json file (alias: --auth-file).",
 	"  --no-open                  Print the login URL without opening a browser.",
 	"  --login-timeout-ms <ms>    Login timeout. Default: 300000",
 	"",
@@ -144,6 +144,7 @@ const createCliParser = (argv: string[]) =>
 		})
 		.option("oauth-file", {
 			type: "string",
+			alias: "auth-file",
 			describe: "Path to the local auth.json file.",
 		})
 		.option("open", {

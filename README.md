@@ -244,9 +244,9 @@ The CLI also supports a few configuration options that generally do not need to 
     </tr>
     <tr>
       <td>Auth file path</td>
-      <td><code>--oauth-file</code></td>
+      <td><code>--oauth-file</code> (alias: <code>--auth-file</code>)</td>
 	  <td><code>--oauth-file</code> path if provided, otherwise <code>$CODEX_HOME/auth.json</code> or <code>~/.codex/auth.json</code></td>
-      <td>Override where the local OAuth auth file is discovered.</td>
+      <td>Override where the local OAuth auth file is discovered. Use a distinct path per account for multi-account setups.</td>
     </tr>
     <tr>
       <td>Open browser</td>
@@ -263,6 +263,49 @@ The CLI also supports a few configuration options that generally do not need to 
   </tbody>
 </table>
 </details>
+
+## Multiple Accounts + Proxies
+
+`@openai-oauth/pool` runs many ChatGPT accounts as one credential source, with full per-account isolation and least-busy + health-aware load balancing across parallel requests.
+
+```bash
+npm i @openai-oauth/pool
+```
+
+Log each account in to its own auth file with the CLI:
+
+```bash
+npx openai-oauth login --auth-file ~/.codex/accounts/alice.json
+npx openai-oauth login --auth-file ~/.codex/accounts/bob.json
+```
+
+```ts
+import { createOpenAIPool } from "@openai-oauth/pool";
+import { createOpenAIOptions } from "@openai-oauth/openai-client";
+import OpenAI from "openai";
+
+const pool = createOpenAIPool({
+	accounts: [
+		{
+			authFilePath: "~/.codex/accounts/alice.json",
+			proxy: "http://user:pass@proxy-a.example:8080",
+			installationId: "device-id-for-alice",
+		},
+		{
+			authFilePath: "~/.codex/accounts/bob.json",
+			proxy: "socks5h://proxy-b.example:1080",
+		},
+	],
+});
+
+// Drop-in replacement anywhere an OpenAIOAuth credential source is accepted:
+const client = new OpenAI(createOpenAIOptions(pool));
+// or: const openai = createOpenAIOAuth(pool)  // Vercel AI SDK
+```
+
+Each account gets its own auth file, its own static proxy (dedicated undici `ProxyAgent`), and its own device identity persisted into its auth file; token refreshes and server-side replay chains never cross accounts. Wire traffic mirrors Codex CLI exactly — per-conversation `session-id`/`thread-id` rotation and a dynamically-resolved `codex_cli_rs/<latest>` user agent — and `transport: "websocket"` optionally carries an account's requests over Codex's realtime websocket (ping/pong keepalive, turn reuse, automatic HTTP fallback). Requests spread over the least-busy healthy account, `429`s fail over to the next account with cooldowns that honor `Retry-After`, and per-account rate-window usage is exposed via `pool.stats()`.
+
+See [`packages/pool`](https://github.com/EvanZhouDev/openai-oauth/tree/main/packages/pool) for the full API.
 
 ## SDK Overview
 
@@ -595,15 +638,3 @@ What is intentionally not there yet:
 OpenAI's Codex CLI uses authenticated endpoints at `chatgpt.com/backend-api/codex` to run models with your ChatGPT account.
 
 By using the same Oauth tokens as Codex, we can effectively use OpenAI's API through Oauth instead of buying API credits.
-
-# Legal
-
-OpenAI OAuth is an unofficial, community-maintained project and is not affiliated with, endorsed by, or sponsored by OpenAI.
-
-OpenAI OAuth uses ChatGPT credentials, which should be treated like passwords.
-
-Each person must use their own ChatGPT account and keep credentials private. Do not pool, share, or redistribute access tokens. Apps offering Sign in with ChatGPT must protect each user's credentials and use them only for requests that user authorizes.
-
-You are responsible for complying with OpenAI's [Terms of Use](https://openai.com/policies/terms-of-use/), [Usage Policies](https://openai.com/policies/usage-policies/), and any agreement that applies to your account. Do not bypass rate limits, restrictions, or safeguards.
-
-Provided as-is with no warranties. OpenAI may change or disable the underlying services at any time, and you assume the risks of using this project.

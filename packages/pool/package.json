@@ -1,0 +1,64 @@
+{
+	"name": "@openai-oauth/pool",
+	"version": "2.0.0",
+	"description": "Multi-account OpenAI OAuth pool with per-account proxies, installation identities, and load-balanced parallelism.",
+	"keywords": [
+		"openai",
+		"oauth",
+		"chatgpt",
+		"codex",
+		"pool",
+		"proxy",
+		"load-balancing"
+	],
+	"type": "module",
+	"engines": {
+		"node": ">=20"
+	},
+	"sideEffects": false,
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"LICENSE",
+		"NOTICE"
+	],
+	"scripts": {
+		"build": "node ../../scripts/clean-dist.mjs && tsc -p tsconfig.build.json",
+		"prepublishOnly": "bun run build",
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"dependencies": {
+		"@openai-oauth/core": "workspace:*",
+		"@openai-oauth/local": "workspace:*",
+		"undici": "^7.16.0"
+	},
+	"devDependencies": {
+		"@types/node": "20.17.24",
+		"typescript": "5.9.2",
+		"vitest": "4.1.10"
+	},
+	"author": "EvanZhouDev",
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/EvanZhouDev/openai-oauth.git",
+		"directory": "packages/pool"
+	},
+	"bugs": {
+		"url": "https://github.com/EvanZhouDev/openai-oauth/issues"
+	},
+	"homepage": "https://github.com/EvanZhouDev/openai-oauth#readme"
+}
