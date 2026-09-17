@@ -47,7 +47,8 @@
 		"@ai-sdk/openai": "3.0.41",
 		"@ai-sdk/provider": "3.0.8",
 		"@ai-sdk/provider-utils": "4.0.19",
-		"@openai-oauth/core": "workspace:*"
+		"@openai-oauth/core": "workspace:*",
+		"js-tiktoken": "^1.0.21"
 	},
 	"devDependencies": {
 		"@openai-oauth/local": "workspace:*",

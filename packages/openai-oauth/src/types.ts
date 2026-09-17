@@ -64,6 +64,7 @@ export type ChatRequest = {
 	top_p?: number
 	stop?: string | string[]
 	max_tokens?: number
+	max_completion_tokens?: number
 	parallel_tool_calls?: boolean
 	reasoning_effort?:
 		| "none"

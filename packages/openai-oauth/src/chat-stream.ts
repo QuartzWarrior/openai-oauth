@@ -5,8 +5,14 @@ import {
 	toModelMessages,
 	toToolChoice,
 } from "./chat-messages.js"
+import { resolveChatOutputLimit } from "./chat-output-limit.js"
 import { emitRequestLog } from "./logging.js"
-import { mapFinishReason, sseHeaders, toUsage } from "./shared.js"
+import {
+	mapFinishReason,
+	sseHeaders,
+	toErrorResponse,
+	toUsage,
+} from "./shared.js"
 import type {
 	ChatRequest,
 	OpenAIOAuthServerLogEvent,
@@ -47,6 +53,10 @@ export const streamChatCompletions = async (
 		startedAt: number
 	},
 ): Promise<Response> => {
+	const outputLimit = resolveChatOutputLimit(request)
+	if (outputLimit.error !== undefined) {
+		return toErrorResponse(outputLimit.error)
+	}
 	const toolIndexes = new Map<string, number>()
 	const toolsWithDeltas = new Set<string>()
 	const created = Math.floor(Date.now() / 1000)
@@ -64,7 +74,7 @@ export const streamChatCompletions = async (
 				: Array.isArray(request.stop)
 					? request.stop
 					: undefined,
-		maxOutputTokens: request.max_tokens,
+		maxOutputTokens: outputLimit.maxOutputTokens,
 		providerOptions: {
 			openai: {
 				parallelToolCalls: request.parallel_tool_calls,

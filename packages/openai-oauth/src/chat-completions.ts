@@ -5,6 +5,7 @@ import {
 	toModelMessages,
 	toToolChoice,
 } from "./chat-messages.js"
+import { resolveChatOutputLimit } from "./chat-output-limit.js"
 import { streamChatCompletions } from "./chat-stream.js"
 import { emitRequestLog } from "./logging.js"
 import {
@@ -77,6 +78,10 @@ export const handleChatCompletionsRequest = async (
 		})
 		return toErrorResponse("`messages` must be an array.")
 	}
+	const outputLimit = resolveChatOutputLimit(body)
+	if (outputLimit.error !== undefined) {
+		return toErrorResponse(outputLimit.error)
+	}
 
 	emitRequestLog(logger, {
 		type: "chat_request",
@@ -107,7 +112,7 @@ export const handleChatCompletionsRequest = async (
 					: Array.isArray(body.stop)
 						? body.stop
 						: undefined,
-			maxOutputTokens: body.max_tokens,
+			maxOutputTokens: outputLimit.maxOutputTokens,
 			providerOptions: {
 				openai: {
 					parallelToolCalls: body.parallel_tool_calls,

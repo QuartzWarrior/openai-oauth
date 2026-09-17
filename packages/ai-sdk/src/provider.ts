@@ -18,6 +18,7 @@ import {
 	type OpenAIOAuthTransport,
 } from "@openai-oauth/core"
 import packageMetadata from "../package.json" with { type: "json" }
+import { enforceOutputTokenLimit } from "./output-limit.js"
 
 export type OpenAIOAuthModelId = string
 export type OpenAIOAuthImageModelId = string
@@ -70,10 +71,29 @@ class CodexResponsesLanguageModel implements LanguageModelV3 {
 		this.supportedUrls = model.supportedUrls
 	}
 
-	doStream(
+	async doStream(
 		options: Parameters<LanguageModelV3["doStream"]>[0],
-	): ReturnType<LanguageModelV3["doStream"]> {
-		return this.model.doStream(options)
+	): Promise<Awaited<ReturnType<LanguageModelV3["doStream"]>>> {
+		const maxOutputTokens = options.maxOutputTokens
+		if (maxOutputTokens === undefined) {
+			return this.model.doStream(options)
+		}
+
+		const abortController = new AbortController()
+		const abort = () => abortController.abort(options.abortSignal?.reason)
+		if (options.abortSignal?.aborted) abort()
+		else options.abortSignal?.addEventListener("abort", abort, { once: true })
+		const result = await this.model.doStream({
+			...options,
+			// The ChatGPT Codex endpoint rejects max_output_tokens. The wrapper
+			// below owns enforcement and aborts its upstream stream at the cap.
+			maxOutputTokens: undefined,
+			abortSignal: abortController.signal,
+		})
+		return enforceOutputTokenLimit(result, maxOutputTokens, () => {
+			options.abortSignal?.removeEventListener("abort", abort)
+			abortController.abort("max_completion_tokens reached")
+		})
 	}
 
 	async doGenerate(
