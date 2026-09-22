@@ -266,7 +266,7 @@ The CLI also supports a few configuration options that generally do not need to 
 
 ## Multiple Accounts + Proxies
 
-`@openai-oauth/pool` runs many ChatGPT accounts as one credential source, with full per-account isolation and least-busy + health-aware load balancing across parallel requests.
+`@openai-oauth/pool` combines explicitly authorized accounts behind one credential source, with account-scoped credentials and health-aware load balancing. This is an unofficial adapter; compatibility tests do not establish exact CLI parity or undetectability.
 
 ```bash
 npm i @openai-oauth/pool
@@ -279,21 +279,84 @@ npx openai-oauth login --auth-file ~/.codex/accounts/alice.json
 npx openai-oauth login --auth-file ~/.codex/accounts/bob.json
 ```
 
+### Proxied login from the local checkout
+
+Build once, then use the local CLI (Node.js 20.18.1+):
+
+```bash
+bun run build
+bun run cli:local login \
+  --no-open \
+  --login-timeout-ms 900000 \
+  --auth-file /home/claude_user/.codex/accounts/account.json \
+  --proxy 'http://user:password@proxy.example:8080' \
+  --pool-config /home/claude_user/.config/openai-oauth/pool.json
+```
+
+This proxies the CLI token exchange, **not the browser** opening the login URL.
+After successful login it sets the matching account's proxy in the pool config
+(or appends the account), preserving unrelated settings. An old `proxyEnv` on
+that account is removed. Restart the pooled server to load the change. Without
+`--pool-config`, it uses the current user's XDG config directory or
+`~/.config/openai-oauth/pool.json`; use the explicit path above when running as
+root for files under `/home/claude_user`. Existing configs must be private regular
+files; observed concurrent edits cause the update to fail rather than overwrite them.
+
+`npx openai-oauth@2.0.0` does not run your edited checkout. The equivalent direct
+local command is `node packages/openai-oauth/dist/cli.js login ...`. Avoid placing
+real proxy passwords in saved shell history; the pool config stores the URL in
+its mode-600 file. See [login proxy details](packages/openai-oauth/README.md#login-through-an-https-proxy).
+
+### Pooled local API server
+
+For a single local OpenAI-compatible endpoint backed by multiple accounts, this
+repository includes a runnable server script. It keeps each account's OAuth
+file and supported outbound HTTP(S) proxy account-scoped, while the pool
+chooses healthy, least-busy accounts. Unsupported proxy runtimes fail closed.
+
+Copy the example to a private location and supply the absolute auth-file paths:
+
+```bash
+mkdir -p /home/claude_user/.config/openai-oauth
+cp pooled-proxy.example.json /home/claude_user/.config/openai-oauth/pool.json
+chmod 600 /home/claude_user/.config/openai-oauth/pool.json
+```
+
+Use `proxyEnv` to keep proxy credentials out of the JSON file. For example,
+set `ALICE_PROXY_URL` and `SECOND_ACCOUNT_PROXY_URL` in a mode-600 environment
+file managed by your process supervisor. Then run:
+
+```bash
+bun run build
+bun run pool:serve -- --config /home/claude_user/.config/openai-oauth/pool.json
+```
+
+The server defaults to `127.0.0.1:10531` and deliberately refuses a
+network-visible host unless `--allow-network` is supplied. To require a bearer
+token on every route, set `"accessTokenEnv": "POOL_API_TOKEN"` in the private
+configuration and supply that environment variable. Without it, keep the service
+on loopback or behind your own authenticated gateway. Use TLS outside loopback;
+a bearer token alone does not encrypt traffic.
+
+The pooled runner defers model discovery until a model-dependent request, such
+as `GET /v1/models`. Explicitly configured models avoid discovery. Any upstream
+discovery uses the selected account's configured network route.
+
 ```ts
 import { createOpenAIPool } from "@openai-oauth/pool";
 import { createOpenAIOptions } from "@openai-oauth/openai-client";
 import OpenAI from "openai";
 
-const pool = createOpenAIPool({
+const pool = await createOpenAIPool({
 	accounts: [
 		{
-			authFilePath: "~/.codex/accounts/alice.json",
+			authFilePath: "/absolute/path/account-a.json",
 			proxy: "http://user:pass@proxy-a.example:8080",
 			installationId: "device-id-for-alice",
 		},
 		{
-			authFilePath: "~/.codex/accounts/bob.json",
-			proxy: "socks5h://proxy-b.example:1080",
+			authFilePath: "/absolute/path/account-b.json",
+			proxy: "http://proxy-b.example:8080",
 		},
 	],
 });
@@ -303,7 +366,47 @@ const client = new OpenAI(createOpenAIOptions(pool));
 // or: const openai = createOpenAIOAuth(pool)  // Vercel AI SDK
 ```
 
-Each account gets its own auth file, its own static proxy (dedicated undici `ProxyAgent`), and its own device identity persisted into its auth file; token refreshes and server-side replay chains never cross accounts. Wire traffic mirrors Codex CLI exactly — per-conversation `session-id`/`thread-id` rotation and a dynamically-resolved `codex_cli_rs/<latest>` user agent — and `transport: "websocket"` optionally carries an account's requests over Codex's realtime websocket (ping/pong keepalive, turn reuse, automatic HTTP fallback). Requests spread over the least-busy healthy account, `429`s fail over to the next account with cooldowns that honor `Retry-After`, and per-account rate-window usage is exposed via `pool.stats()`.
+Accounts use separate credential files and transport state. Continuations stay on
+the account that owns the predecessor response; missing ownership fails explicitly
+rather than dropping conversation history. Quota/authentication failures are not
+replayed under another account. Proxy or custom-fetch configurations use HTTP when
+the WebSocket implementation cannot honor that route. `pool.stats()` reports
+stream-lifetime load and observed rate information. These are locally tested
+behaviors, not a guarantee of live-provider compatibility, throughput, anonymity,
+or exact CLI equivalence.
+
+The SDK also provides opt-in diagnostics: named quota observations in `pool.stats()[i].quota`, account-specific `pool.getModelCatalog(name, options)` snapshots, typed model capabilities with explicit listing modes, and core's pure `inspectContextBudget` helper. These do not change default model visibility or scheduling or automatically compact conversations. See the [pool diagnostics](packages/pool/README.md#quota-diagnostics) and [core catalog/context APIs](packages/core/README.md#model-catalogs-and-capabilities).
+
+### HTTP pool diagnostics
+
+Rebuild and enable the optional inspection routes:
+
+```bash
+bun run build
+bun run pool:serve -- --config /absolute/path/pool.json --diagnostics
+```
+
+Alternatively set `"diagnostics": true` in the private pool JSON. It defaults to false. Restart the runner after configuration changes. These routes are under `/pool`, **not** `/v1`:
+
+```bash
+# When accessTokenEnv is configured, supply its token on every request.
+curl http://127.0.0.1:10531/pool/stats \
+  -H "Authorization: Bearer $POOL_API_TOKEN"
+
+curl 'http://127.0.0.1:10531/pool/models?account=alice&mode=oauth-visible' \
+  -H "Authorization: Bearer $POOL_API_TOKEN"
+
+curl http://127.0.0.1:10531/pool/context \
+  -H "Authorization: Bearer $POOL_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"account":"alice","request":{"model":"your-model","input":"Hello"},"estimate":"characters"}'
+```
+
+`/pool/stats` reads current local observations. Set `"healthRefreshMs": true` (60 seconds) or a positive interval in the private pool JSON to periodically refresh each account's health and any quota/rate headers returned by authenticated `/models` probes. `/pool/models` supports `mode=public-api|oauth-visible|all`, `cacheOnly=true|false`, and `refresh=true|false`; cache-only and refresh cannot both be enabled. It inspects exactly one configured account, not an automatically chosen inference account. Model snapshots expose typed capabilities without raw metadata or internal owner IDs.
+
+`/pool/context` uses **cached metadata only**, makes no inference/token-refresh request, and never echoes the prompt. Fetch `/pool/models` first to populate metadata. Its default estimate is `none`; `characters` uses a deliberately rough `ceil(UTF-16 text length / 4)` heuristic labeled `characters-div-4`. It is not a tokenizer, exact remaining-token count or compaction operation; media/overhead and unresolved history remain unknown.
+
+All enabled diagnostics reuse the server's existing bearer/custom authorization. **A token that can access diagnostics can inspect all configured accounts; it is not tenant isolation.** Internal account/installation IDs, paths and raw model fields are omitted, but names and usage/capabilities are still operational data. Responses are `no-store`. Keep the default loopback binding or use your own authenticated TLS boundary; enabling diagnostics does not add credentials or relax `--allow-network` protections.
 
 See [`packages/pool`](https://github.com/EvanZhouDev/openai-oauth/tree/main/packages/pool) for the full API.
 

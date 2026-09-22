@@ -51,6 +51,9 @@ export type BrowserSessionOptions = {
 	tokenUrl?: string
 	fetch?: FetchFunction
 	refresh?: boolean
+	signal?: AbortSignal
+	/** Shared refresh deadline; subscriber cancellation stays independent. Default 30 seconds. */
+	refreshTimeoutMs?: number
 	now?: () => Date
 }
 
@@ -69,6 +72,8 @@ export type StartLoginOptions = Omit<
 	redirectUri?: string
 	returnTo?: string
 	openMode?: "redirect" | "popup"
+	/** Store whose pending maintenance must yield to this explicit login intent. */
+	sessionStore?: SessionStore
 }
 
 export type CompleteLoginOptions = {
@@ -79,6 +84,9 @@ export type CompleteLoginOptions = {
 	fetch?: FetchFunction
 	now?: () => Date
 	url?: string
+	signal?: AbortSignal
+	/** Shared callback exchange deadline; subscriber cancellation stays independent. Default 5 minutes. */
+	callbackTimeoutMs?: number
 }
 
 export type LogoutOptions = {
@@ -424,9 +432,19 @@ const getCryptoKey = async (settings: StoreSettings): Promise<CryptoKey> => {
 		return existing
 	}
 
-	const key = await generateCryptoKey()
-	await setRecord(settings, settings.cryptoKey, key)
-	return key
+	// Generate outside the transaction, then recheck under its exclusive write
+	// lock. Another tab may have installed a key while WebCrypto was running.
+	const candidate = await generateCryptoKey()
+	return withStore(settings, "readwrite", async (store) => {
+		const record = await requestToPromise<StoredRecord<CryptoKey> | undefined>(
+			store.get(settings.cryptoKey),
+		)
+		if (record) return record.value
+		await requestToPromise(
+			store.put({ id: settings.cryptoKey, value: candidate }),
+		)
+		return candidate
+	})
 }
 
 const encryptSession = async (
@@ -476,6 +494,199 @@ const decryptSession = async (
 	return session as OpenAIOAuthSession
 }
 
+type SessionSnapshot = {
+	session: OpenAIOAuthSession | null
+	encrypted?: EncryptedSession
+}
+
+type SharedSessionOperation = {
+	promise: Promise<OpenAIOAuthSession | null>
+	controller: AbortController
+	waiters: number
+}
+
+type PendingSessionRefresh = SharedSessionOperation & {
+	generation: number
+}
+
+type PendingLoginOperation = SharedSessionOperation & {
+	key: string
+	generation: number
+	snapshot?: SessionSnapshot
+	retentionTimer?: ReturnType<typeof setTimeout>
+}
+
+type SessionCoordination = {
+	/** Changes for explicit login/logout/replacement, not maintenance refresh. */
+	generation: number
+	tail: Promise<void>
+	refresh?: PendingSessionRefresh
+	login?: PendingLoginOperation
+}
+
+type BrowserStoreOperations = {
+	read(): Promise<SessionSnapshot>
+	compareAndSet(
+		snapshot: SessionSnapshot,
+		session: OpenAIOAuthSession,
+		signal?: AbortSignal,
+	): Promise<SessionSnapshot | undefined>
+}
+
+const coordinators = new WeakMap<SessionStore, SessionCoordination>()
+const browserCoordinators = new Map<string, SessionCoordination>()
+const browserStoreOperations = new WeakMap<
+	SessionStore,
+	BrowserStoreOperations
+>()
+
+const newCoordination = (): SessionCoordination => ({
+	generation: 0,
+	tail: Promise.resolve(),
+})
+
+const coordinationFor = (store: SessionStore): SessionCoordination => {
+	let coordination = coordinators.get(store)
+	if (!coordination) {
+		coordination = newCoordination()
+		coordinators.set(store, coordination)
+	}
+	return coordination
+}
+
+const invalidatePendingLogin = (coordination: SessionCoordination): void => {
+	coordination.login?.controller.abort()
+	clearTimeout(coordination.login?.retentionTimer)
+	coordination.login = undefined
+}
+
+const invalidateSessionOwner = (coordination: SessionCoordination): void => {
+	coordination.generation += 1
+	invalidatePendingLogin(coordination)
+}
+
+const serializeSessionOperation = <T>(
+	coordination: SessionCoordination,
+	operation: () => Promise<T>,
+): Promise<T> => {
+	const result = coordination.tail.then(operation)
+	coordination.tail = result.then(
+		() => undefined,
+		() => undefined,
+	)
+	return result
+}
+
+const sameSession = (
+	left: OpenAIOAuthSession | null,
+	right: OpenAIOAuthSession | null,
+): boolean =>
+	left === right ||
+	(left !== null &&
+		right !== null &&
+		left.accountId === right.accountId &&
+		left.accessToken === right.accessToken &&
+		left.refreshToken === right.refreshToken &&
+		left.idToken === right.idToken &&
+		left.isFedRamp === right.isFedRamp &&
+		left.expiresAt === right.expiresAt &&
+		left.lastRefresh === right.lastRefresh)
+
+const readSessionSnapshot = (store: SessionStore): Promise<SessionSnapshot> => {
+	const browser = browserStoreOperations.get(store)
+	return browser
+		? browser.read()
+		: store
+				.get()
+				.then((session) => ({ session: session ? { ...session } : null }))
+}
+
+const waitForSessionOperation = <T>(
+	promise: Promise<T>,
+	signal?: AbortSignal,
+): Promise<T> => {
+	if (!signal) return promise
+	return new Promise((resolve, reject) => {
+		const abort = () =>
+			reject(signal.reason ?? new DOMException("Aborted", "AbortError"))
+		signal.addEventListener("abort", abort, { once: true })
+		void promise.then(
+			(value) => {
+				signal.removeEventListener("abort", abort)
+				resolve(value)
+			},
+			(error) => {
+				signal.removeEventListener("abort", abort)
+				reject(error)
+			},
+		)
+		if (signal.aborted) abort()
+	})
+}
+
+const readCurrentSession = (
+	store: SessionStore,
+	signal?: AbortSignal,
+): Promise<OpenAIOAuthSession | null> =>
+	waitForSessionOperation(
+		serializeSessionOperation(coordinationFor(store), () => store.get()),
+		signal,
+	)
+
+const commitSession = (
+	store: SessionStore,
+	snapshotOrRead: SessionSnapshot | (() => SessionSnapshot),
+	generation: number,
+	session: OpenAIOAuthSession,
+	signal?: AbortSignal,
+	ownerChange = false,
+): Promise<boolean> => {
+	const coordination = coordinationFor(store)
+	return serializeSessionOperation(coordination, async () => {
+		signal?.throwIfAborted()
+		if (coordination.generation !== generation) return false
+		const snapshot =
+			typeof snapshotOrRead === "function" ? snapshotOrRead() : snapshotOrRead
+		const browser = browserStoreOperations.get(store)
+		let committed: SessionSnapshot
+		if (browser) {
+			const next = await browser.compareAndSet(snapshot, session, signal)
+			if (!next) return false
+			committed = next
+		} else {
+			// Custom stores need their own CAS for writers outside this realm.
+			if (
+				!sameSession(await store.get(), snapshot.session) ||
+				coordination.generation !== generation
+			)
+				return false
+			signal?.throwIfAborted()
+			await store.set(session)
+			committed = { session: { ...session } }
+		}
+		if (coordination.generation !== generation) return false
+		if (ownerChange) {
+			coordination.generation += 1
+			if (coordination.login?.generation === generation) {
+				coordination.login.generation = coordination.generation
+			}
+		} else {
+			// Maintenance may rotate the old credential while an explicit login is
+			// pending. Advance only that login's verified predecessor snapshot, not
+			// its owner-intent generation, so the intentional login can still commit.
+			const login = coordination.login
+			if (
+				login?.generation === generation &&
+				login.snapshot &&
+				sameSession(login.snapshot.session, snapshot.session)
+			) {
+				login.snapshot = committed
+			}
+		}
+		return true
+	})
+}
+
 export const createSessionStore = (
 	options: BrowserSessionStoreOptions = {},
 ): SessionStore => {
@@ -484,35 +695,81 @@ export const createSessionStore = (
 		...options,
 	}
 
-	return {
-		get: async () => {
-			const encrypted = await getRecord<EncryptedSession>(
-				settings,
-				settings.sessionKey,
-			)
-			if (!encrypted) {
-				return null
-			}
-			if (
-				typeof encrypted.iv !== "string" ||
-				typeof encrypted.ciphertext !== "string"
-			) {
-				throw new Error("The stored OpenAI OAuth session is malformed.")
-			}
-			return decryptSession(await getCryptoKey(settings), encrypted)
+	const coordinationKey = JSON.stringify([
+		settings.dbName,
+		settings.storeName,
+		settings.sessionKey,
+	])
+	let coordination = browserCoordinators.get(coordinationKey)
+	if (!coordination) {
+		coordination = newCoordination()
+		browserCoordinators.set(coordinationKey, coordination)
+	}
+	const current = coordination
+	const read = async (): Promise<SessionSnapshot> => {
+		const encrypted = await getRecord<EncryptedSession>(
+			settings,
+			settings.sessionKey,
+		)
+		if (!encrypted) return { session: null }
+		if (
+			typeof encrypted.iv !== "string" ||
+			typeof encrypted.ciphertext !== "string"
+		) {
+			throw new Error("The stored OpenAI OAuth session is malformed.")
+		}
+		return {
+			encrypted,
+			session: await decryptSession(await getCryptoKey(settings), encrypted),
+		}
+	}
+	const store: SessionStore = {
+		get: async () => (await read()).session,
+		set: (session) => {
+			invalidateSessionOwner(current)
+			return serializeSessionOperation(current, async () => {
+				const key = await getCryptoKey(settings)
+				await setRecord(
+					settings,
+					settings.sessionKey,
+					await encryptSession(key, session),
+				)
+			})
 		},
-		set: async (session) => {
-			const key = await getCryptoKey(settings)
-			await setRecord(
-				settings,
-				settings.sessionKey,
-				await encryptSession(key, session),
+		clear: () => {
+			invalidateSessionOwner(current)
+			return serializeSessionOperation(current, () =>
+				deleteRecord(settings, settings.sessionKey),
 			)
-		},
-		clear: async () => {
-			await deleteRecord(settings, settings.sessionKey)
 		},
 	}
+	coordinators.set(store, current)
+	browserStoreOperations.set(store, {
+		read,
+		compareAndSet: async (snapshot, session, signal) => {
+			const encrypted = await encryptSession(
+				await getCryptoKey(settings),
+				session,
+			)
+			signal?.throwIfAborted()
+			return withStore(settings, "readwrite", async (records) => {
+				const record = await requestToPromise<
+					StoredRecord<EncryptedSession> | undefined
+				>(records.get(settings.sessionKey))
+				if (
+					record?.value.iv !== snapshot.encrypted?.iv ||
+					record?.value.ciphertext !== snapshot.encrypted?.ciphertext
+				)
+					return undefined
+				signal?.throwIfAborted()
+				await requestToPromise(
+					records.put({ id: settings.sessionKey, value: encrypted }),
+				)
+				return { session: { ...session }, encrypted }
+			})
+		},
+	})
+	return store
 }
 
 let defaultSessionStore: SessionStore | undefined
@@ -626,36 +883,140 @@ export const refreshSession = async (
 	})
 }
 
-export const getSession = async (
-	options: BrowserSessionOptions = {},
+const joinSessionOperation = (
+	pending: SharedSessionOperation,
+	signal?: AbortSignal,
 ): Promise<OpenAIOAuthSession | null> => {
-	const sessionStore = options.sessionStore ?? getDefaultSessionStore()
-	const now = options.now ?? (() => new Date())
-	const shouldRefresh = options.refresh ?? true
+	pending.waiters += 1
+	return new Promise((resolve, reject) => {
+		let settled = false
+		const finish = (operation: () => void) => {
+			if (settled) return
+			settled = true
+			signal?.removeEventListener("abort", abort)
+			pending.waiters -= 1
+			operation()
+		}
+		const abort = () =>
+			finish(() => {
+				if (pending.waiters === 0) pending.controller.abort()
+				reject(signal?.reason ?? new DOMException("Aborted", "AbortError"))
+			})
+		signal?.addEventListener("abort", abort, { once: true })
+		void pending.promise.then(
+			(session) => finish(() => resolve(session)),
+			(error) => finish(() => reject(error)),
+		)
+		if (signal?.aborted) abort()
+	})
+}
 
-	const session = await sessionStore.get()
+const loadSession = async (
+	options: BrowserSessionOptions,
+	force: boolean,
+): Promise<OpenAIOAuthSession | null> => {
+	options.signal?.throwIfAborted()
+	const timeoutMs = options.refreshTimeoutMs ?? 30_000
+	if (
+		!Number.isSafeInteger(timeoutMs) ||
+		timeoutMs <= 0 ||
+		timeoutMs > 2_147_483_647
+	)
+		throw new Error("refreshTimeoutMs must be a positive supported duration.")
+	const store = options.sessionStore ?? getDefaultSessionStore()
+	const coordination = coordinationFor(store)
+	const generation = coordination.generation
+	if (
+		options.refresh !== false &&
+		coordination.refresh?.generation === generation &&
+		!coordination.refresh.controller.signal.aborted
+	) {
+		return joinSessionOperation(coordination.refresh, options.signal)
+	}
+	const snapshot = await waitForSessionOperation(
+		serializeSessionOperation(coordination, () => readSessionSnapshot(store)),
+		options.signal,
+	)
+	options.signal?.throwIfAborted()
+	if (coordination.generation !== generation)
+		return readCurrentSession(store, options.signal)
+	const session = snapshot.session
 	if (
 		!session ||
-		!shouldRefresh ||
+		options.refresh === false ||
 		!session.refreshToken ||
-		!shouldRefreshSession(session, now())
+		(!force &&
+			!shouldRefreshSession(session, (options.now ?? (() => new Date()))()))
 	) {
 		return session
 	}
-
-	const refreshed = await refreshSession(
-		{
-			refreshToken: session.refreshToken,
-		},
-		options,
+	if (
+		coordination.refresh?.generation === generation &&
+		!coordination.refresh.controller.signal.aborted
+	) {
+		return joinSessionOperation(coordination.refresh, options.signal)
+	}
+	const refreshToken = session.refreshToken
+	const controller = new AbortController()
+	const signal = controller.signal
+	const timeout = setTimeout(
+		() =>
+			controller.abort(new Error("OpenAI OAuth session refresh timed out.")),
+		timeoutMs,
 	)
-	const nextSession =
-		session.isFedRamp && !refreshed.isFedRamp
-			? { ...refreshed, isFedRamp: true }
-			: refreshed
-	await sessionStore.set(nextSession)
-	return nextSession
+	const work = (async () => {
+		try {
+			const refreshed = await refreshSession(
+				{
+					refreshToken,
+					signal,
+				},
+				options,
+			)
+			signal.throwIfAborted()
+			if (refreshed.accountId !== session.accountId) {
+				throw new Error("Refreshed OpenAI OAuth session changed account.")
+			}
+			const next =
+				session.isFedRamp && !refreshed.isFedRamp
+					? { ...refreshed, isFedRamp: true }
+					: refreshed
+			if (await commitSession(store, snapshot, generation, next, signal))
+				return next
+			return readCurrentSession(store, signal)
+		} catch (error) {
+			signal.throwIfAborted()
+			const current = await readCurrentSession(store, signal)
+			if (
+				coordination.generation !== generation ||
+				!sameSession(current, session)
+			)
+				return current
+			throw error
+		}
+	})()
+	// Bound the complete shared operation, including serialized storage work.
+	// Its signal also fences continuations that outlive an ignored abort.
+	const promise = waitForSessionOperation(work, signal)
+	const pending = { generation, promise, controller, waiters: 0 }
+	coordination.refresh = pending
+	const clear = () => {
+		clearTimeout(timeout)
+		if (coordination.refresh === pending) coordination.refresh = undefined
+	}
+	void promise.then(clear, clear)
+	return joinSessionOperation(pending, options.signal)
 }
+
+export const getSession = (
+	options: BrowserSessionOptions = {},
+): Promise<OpenAIOAuthSession | null> => loadSession(options, false)
+
+/** Refresh the current stored credential without overwriting a newer login. */
+export const refreshStoredSession = (
+	options: BrowserSessionOptions = {},
+): Promise<OpenAIOAuthSession | null> =>
+	loadSession({ ...options, refresh: true }, true)
 
 export const openaiAuthHeaders = async (
 	options: OpenAIAuthHeadersOptions = {},
@@ -767,6 +1128,11 @@ export const startLogin = async (
 		}
 	}
 
+	const coordination = coordinationFor(
+		options.sessionStore ?? getDefaultSessionStore(),
+	)
+	invalidateSessionOwner(coordination)
+	const generation = coordination.generation
 	const returnTo = options.returnTo ?? getCurrentRelativeUrl()
 	const callbackUrl = options.callbackPath
 		? getDefaultRedirectUri(options.callbackPath)
@@ -788,6 +1154,9 @@ export const startLogin = async (
 		redirectUri,
 	})
 
+	if (coordination.generation !== generation) {
+		throw new Error("OpenAI OAuth login was superseded.")
+	}
 	writePendingLogin({
 		state: request.state,
 		codeVerifier: request.codeVerifier,
@@ -811,71 +1180,171 @@ export const startLogin = async (
 	return { status: "started" }
 }
 
+const callbackOperationKey = (
+	pending: PendingLogin,
+	code: string,
+	options: CompleteLoginOptions,
+): string =>
+	JSON.stringify([
+		pending.state,
+		pending.codeVerifier,
+		pending.redirectUri,
+		code,
+		options.clientId ?? null,
+		options.issuer ?? null,
+		options.tokenUrl ?? null,
+	])
+
 export const completeLogin = async (
 	options: CompleteLoginOptions = {},
 ): Promise<OpenAIOAuthSession | null> => {
+	options.signal?.throwIfAborted()
 	const browserWindow = assertBrowserWindow()
 	const url = new URL(options.url ?? browserWindow.location.href)
 	const oauthError = url.searchParams.get("error")
 	const code = url.searchParams.get("code")
 	const callbackState = url.searchParams.get("state")
 	const sessionStore = options.sessionStore ?? getDefaultSessionStore()
-
-	if (!oauthError && !code) {
-		return null
-	}
+	if (!oauthError && !code) return null
 
 	const pending = readPendingLogin()
 	if (!pending) {
-		const existingSession = await sessionStore.get()
+		const existingSession = await readCurrentSession(
+			sessionStore,
+			options.signal,
+		)
+		options.signal?.throwIfAborted()
 		if (existingSession) {
 			browserWindow.history.replaceState(null, "", "/")
 			return existingSession
 		}
 	}
-
 	if (oauthError) {
 		if (
 			oauthError === "access_denied" &&
 			pending &&
 			callbackState === pending.state
 		) {
+			invalidateSessionOwner(coordinationFor(sessionStore))
 			clearPendingLogin()
 			browserWindow.history.replaceState(null, "", pending.returnTo || "/")
 			return null
 		}
-
 		throw new Error(
 			url.searchParams.get("error_description") ??
 				`OpenAI OAuth returned ${oauthError}.`,
 		)
 	}
-
-	if (!pending || !callbackState || pending.state !== callbackState) {
+	if (!pending || !callbackState || pending.state !== callbackState)
 		throw new Error("OpenAI OAuth callback state did not match.")
-	}
+	if (!code) throw new Error("OpenAI OAuth callback did not include a code.")
 
-	if (!code) {
-		throw new Error("OpenAI OAuth callback did not include a code.")
+	const coordination = coordinationFor(sessionStore)
+	const key = callbackOperationKey(pending, code, options)
+	if (
+		coordination.login?.key === key &&
+		coordination.login.generation === coordination.generation
+	) {
+		return joinSessionOperation(coordination.login, options.signal)
 	}
-
-	const session = await exchangeCode(
-		{
-			code,
-			codeVerifier: pending.codeVerifier,
-			redirectUri: pending.redirectUri,
-		},
-		options,
+	const timeoutMs = options.callbackTimeoutMs ?? 5 * 60 * 1000
+	if (
+		!Number.isSafeInteger(timeoutMs) ||
+		timeoutMs <= 0 ||
+		timeoutMs > 2_147_483_647
 	)
-	await sessionStore.set(session)
-	clearPendingLogin()
-	browserWindow.history.replaceState(null, "", pending.returnTo || "/")
-	return session
+		throw new Error("Callback timeout must be a positive supported duration.")
+	invalidateSessionOwner(coordination)
+	const generation = coordination.generation
+	const controller = new AbortController()
+	const operation: PendingLoginOperation = {
+		key,
+		generation,
+		controller,
+		waiters: 0,
+		promise: Promise.resolve(null),
+	}
+	coordination.login = operation
+	const timeout = setTimeout(
+		() =>
+			controller.abort(new Error("OpenAI OAuth callback exchange timed out.")),
+		timeoutMs,
+	)
+	const signal = controller.signal
+	const work = Promise.resolve().then(async () => {
+		// Read under the same serialization tail as maintenance writes. A refresh
+		// can later advance this snapshot only after a verified same-owner commit.
+		await waitForSessionOperation(
+			serializeSessionOperation(coordination, async () => {
+				signal.throwIfAborted()
+				operation.snapshot = await readSessionSnapshot(sessionStore)
+			}),
+			signal,
+		)
+		signal.throwIfAborted()
+		const session = await waitForSessionOperation(
+			exchangeCode(
+				{
+					code,
+					codeVerifier: pending.codeVerifier,
+					redirectUri: pending.redirectUri,
+					signal,
+				},
+				options,
+			),
+			signal,
+		)
+		signal.throwIfAborted()
+		if (readPendingLogin()?.state !== pending.state) return null
+		if (
+			!(await waitForSessionOperation(
+				commitSession(
+					sessionStore,
+					() => {
+						if (!operation.snapshot)
+							throw new Error("Login snapshot is unavailable.")
+						return operation.snapshot
+					},
+					generation,
+					session,
+					signal,
+					true,
+				),
+				signal,
+			))
+		)
+			return null
+		if (readPendingLogin()?.state === pending.state) {
+			clearPendingLogin()
+			browserWindow.history.replaceState(null, "", pending.returnTo || "/")
+		}
+		return session
+	})
+	operation.promise = waitForSessionOperation(work, signal)
+	const settled = () => {
+		clearTimeout(timeout)
+		if (coordination.login !== operation) return
+		// Retain at most one settled callback for this store for a short window:
+		// a duplicate consumer must not exchange the same one-use code again.
+		operation.retentionTimer = setTimeout(() => {
+			if (coordination.login === operation) coordination.login = undefined
+		}, 60_000)
+		;(operation.retentionTimer as unknown as { unref?: () => void }).unref?.()
+	}
+	void operation.promise.then(settled, settled)
+	return joinSessionOperation(operation, options.signal)
 }
 
 export const logout = async (options: LogoutOptions = {}): Promise<void> => {
 	try {
 		clearPendingLogin()
 	} catch {}
-	await (options.sessionStore ?? getDefaultSessionStore()).clear()
+	const store = options.sessionStore ?? getDefaultSessionStore()
+	const coordination = coordinationFor(store)
+	invalidateSessionOwner(coordination)
+	if (browserStoreOperations.has(store)) {
+		await store.clear()
+	} else {
+		await serializeSessionOperation(coordination, () => store.clear())
+	}
 }

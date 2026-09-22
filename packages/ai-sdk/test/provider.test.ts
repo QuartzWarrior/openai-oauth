@@ -1,6 +1,152 @@
+import type { LanguageModelV3, SharedV3Warning } from "@ai-sdk/provider"
 import { generateImage, generateText } from "ai"
 import { describe, expect, test, vi } from "vitest"
 import { createOpenAIOAuth } from "../src/index.js"
+
+type CallOptions = Parameters<LanguageModelV3["doStream"]>[0]
+
+const reasoningRequest = async (
+	method: "doGenerate" | "doStream",
+	providerOptions?: CallOptions["providerOptions"],
+	name?: string,
+) => {
+	let body: Record<string, unknown> = {}
+	const provider = createOpenAIOAuth(
+		{
+			kind: "openai-compatible",
+			baseURL: "https://ready.test/v1",
+			request: async () => {
+				throw new Error("unexpected request dispatch")
+			},
+			fetch: async (_url, init) => {
+				body = JSON.parse(String(init?.body))
+				return new Response(
+					`data: ${JSON.stringify({
+						type: "response.completed",
+						response: {
+							id: "resp_reasoning",
+							model: "gpt-6-astra",
+							status: "completed",
+							output: [],
+							usage: { input_tokens: 1, output_tokens: 1 },
+						},
+					})}\n\n`,
+					{ headers: { "content-type": "text/event-stream" } },
+				)
+			},
+		},
+		{ name },
+	)
+	const options: CallOptions = {
+		prompt: [{ role: "user", content: [{ type: "text", text: "hello" }] }],
+		providerOptions,
+	}
+	const model = provider("gpt-6-astra")
+	if (method === "doGenerate") {
+		const result = await model.doGenerate(options)
+		return { body, warnings: result.warnings }
+	}
+	const result = await model.doStream(options)
+	const warnings: SharedV3Warning[] = []
+	const reader = result.stream.getReader()
+	try {
+		while (true) {
+			const { done, value } = await reader.read()
+			if (done) break
+			if (value.type === "stream-start") warnings.push(...value.warnings)
+			if (value.type === "error") throw value.error
+		}
+	} finally {
+		reader.releaseLock()
+	}
+	return { body, warnings }
+}
+
+describe.each([
+	"doGenerate",
+	"doStream",
+] as const)("reasoning options via %s", (method) => {
+	test.each([
+		"high",
+		"none",
+		"xhigh",
+	])("forwards explicit effort %s for an unrecognized model", async (effort) => {
+		const openai = Object.freeze({
+			reasoningEffort: effort,
+			reasoningSummary: "detailed",
+			parallelToolCalls: false,
+			store: false,
+		})
+		const providerOptions = Object.freeze({
+			openai,
+			other: Object.freeze({ key: "kept" }),
+		})
+		const { body, warnings } = await reasoningRequest(method, providerOptions)
+		expect(body).toMatchObject({
+			model: "gpt-6-astra",
+			reasoning: { effort, summary: "detailed" },
+			parallel_tool_calls: false,
+			store: false,
+		})
+		expect(warnings).toEqual([])
+		expect(providerOptions).toEqual({ openai, other: { key: "kept" } })
+		expect(openai).not.toHaveProperty("forceReasoning")
+	})
+
+	test("forwards summary without requiring an effort", async () => {
+		const { body, warnings } = await reasoningRequest(method, {
+			openai: { reasoningSummary: "auto" },
+		})
+		expect(body.reasoning).toEqual({ summary: "auto" })
+		expect(warnings).toEqual([])
+	})
+
+	test("preserves an explicit opt-out and its warning", async () => {
+		const { body, warnings } = await reasoningRequest(method, {
+			openai: { reasoningEffort: "high", forceReasoning: false },
+		})
+		expect(body.reasoning).toBeUndefined()
+		expect(warnings).toContainEqual(
+			expect.objectContaining({
+				type: "unsupported",
+				feature: "reasoningEffort",
+			}),
+		)
+	})
+
+	test("preserves an explicit opt-in", async () => {
+		const { body, warnings } = await reasoningRequest(method, {
+			openai: { reasoningEffort: "high", forceReasoning: true },
+		})
+		expect(body.reasoning).toEqual({ effort: "high" })
+		expect(warnings).toEqual([])
+	})
+
+	test.each([
+		undefined,
+		{ other: { key: "kept" } },
+		{ openai: { reasoningEffort: null, store: false } },
+	])("does not force reasoning without explicit reasoning options (%j)", async (providerOptions) => {
+		const { body, warnings } = await reasoningRequest(method, providerOptions)
+		expect(body.reasoning).toBeUndefined()
+		expect(body.include ?? []).not.toContain("reasoning.encrypted_content")
+		expect(warnings).toEqual([])
+	})
+
+	test.each([
+		{ azure: { reasoningEffort: "high" } },
+		{ openai: { reasoningEffort: "high" } },
+		{ azure: { reasoningEffort: "high" }, openai: { forceReasoning: false } },
+	])("uses the SDK option namespace for custom provider names (%j)", async (providerOptions) => {
+		const { body, warnings } = await reasoningRequest(
+			method,
+			providerOptions,
+			"azure-custom",
+		)
+		expect(body.reasoning).toEqual({ effort: "high" })
+		expect(warnings).toEqual([])
+	})
+})
 
 describe("createOpenAIOAuth", () => {
 	test("uses request-bound OAuth credentials for generateText calls", async () => {

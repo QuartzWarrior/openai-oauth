@@ -1,13 +1,33 @@
-import { CODEX_IMAGE_MODEL, prepareCodexImageRequest } from "./images.js"
+import { createModelCatalogCache } from "./catalog.js"
 import {
+	CODEX_IMAGE_MODEL,
+	type CodexImageLimits,
+	prepareCodexImageRequest,
+} from "./images.js"
+import {
+	type CodexModelCatalogSnapshot,
 	type CodexModelInfo,
 	DEFAULT_CODEX_CLIENT_VERSION,
-	fetchCodexModelCatalog,
+	fetchCodexModelCatalogSnapshot,
+	type GetModelCatalogOptions,
 	isPublicCodexModel,
 	resolveCodexClientVersion,
 } from "./models.js"
-import { collectCompletedResponseFromSse } from "./sse.js"
+import {
+	collectCompletedResponseFromSse,
+	ResponseSseCollector,
+	type SseLimits,
+	SseParser,
+} from "./sse.js"
 import { CodexResponsesState } from "./state.js"
+import {
+	createOperationScope,
+	fetchWithSignal,
+	readBoundedText,
+	readWithSignal,
+	validateTimeout,
+	waitWithSignal,
+} from "./stream-utils.js"
 import { isRecord, randomUUIDv7 } from "./utils.js"
 
 export const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
@@ -110,8 +130,6 @@ export const DEFAULT_OPENAI_OAUTH_ISSUER = "https://auth.openai.com"
 export const DEFAULT_OPENAI_OAUTH_SCOPE =
 	"openid profile email offline_access api.connectors.read api.connectors.invoke"
 const DEFAULT_CODEX_INSTRUCTIONS = ""
-const MODEL_CATALOG_TTL_MS = 5 * 60 * 1000
-const MODEL_CATALOG_FAILURE_TTL_MS = 60 * 1000
 const RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
 
 export type FetchFunction = typeof fetch
@@ -132,6 +150,8 @@ export type OpenAIOAuthSessionInput =
 
 export type OpenAIOAuth = {
 	kind: "openai-oauth"
+	/** Already-authenticating transport; adapters must not wrap it again. */
+	transport?: OpenAIOAuthTransport
 	getSession(): Promise<OpenAIOAuthSession | null>
 	baseURL?: string
 	fetch?: FetchFunction
@@ -206,7 +226,49 @@ export type RefreshOpenAIOAuthTokensOptions = {
 	userAgent?: string
 }
 
+export type ExecuteResponses = (
+	url: string,
+	init: RequestInit,
+	session: OpenAIOAuthSession,
+) => Promise<Response>
+
+export type ResponsesContext = {
+	session: OpenAIOAuthSession
+	request: Record<string, unknown>
+	headers: Headers
+}
+
+export type ModelCatalogResponseContext = {
+	session: OpenAIOAuthSession
+}
+
 type CodexOAuthRuntimeSettings = {
+	/** Transport-owned lifetime; unlike caller signals, also cancels shared catalog work. */
+	signal?: AbortSignal
+	requestTimeoutMs?: number
+	streamIdleTimeoutMs?: number
+	modelCatalogTimeoutMs?: number
+	imageLimits?: CodexImageLimits
+	onResponseCompleted?: (
+		response: Record<string, unknown>,
+		context: ResponsesContext,
+	) => void
+	onResponseEvent?: (
+		event: Record<string, unknown>,
+		context: ResponsesContext,
+	) => void
+	onResponseError?: (error: unknown, context: ResponsesContext) => void
+	/** Observes authenticated /models responses without exposing catalog internals. */
+	onModelCatalogResponse?: (
+		response: Response,
+		context: ModelCatalogResponseContext,
+	) => void
+	/** Internal transport seam: return upstream SSE; core owns normalization and finalization. */
+	executeResponses?: ExecuteResponses
+	/** SSE event and collected response budgets. */
+	responseLimits?: SseLimits
+	/** Maximum age of last-known-good model metadata used after a refresh failure. */
+	modelCatalogMaxStaleMs?: number
 	auth: OpenAIOAuthSessionInput
 	baseURL?: string
 	codexVersion?: string
@@ -243,9 +305,13 @@ export type OpenAIOAuthTransport = {
 	baseURL: string
 	fetch: FetchFunction
 	request: (path: string, init?: RequestInit) => Promise<Response>
+	getModelCatalog?: (
+		options?: GetModelCatalogOptions,
+	) => Promise<CodexModelCatalogSnapshot>
 }
 
 type RequestParts = {
+	redirect?: RequestRedirect
 	url: string
 	method?: string
 	headers: Headers
@@ -432,6 +498,36 @@ const toTokenResponse = (payload: unknown): OpenAIOAuthTokenResponse => {
 	}
 }
 
+const OAUTH_ERROR_CODES = new Set([
+	"invalid_request",
+	"invalid_client",
+	"invalid_grant",
+	"unauthorized_client",
+	"unsupported_grant_type",
+	"invalid_scope",
+	"access_denied",
+	"server_error",
+	"temporarily_unavailable",
+	"refresh_token_expired",
+	"refresh_token_reused",
+	"refresh_token_invalidated",
+])
+
+export class OAuthTokenError extends Error {
+	readonly status: number
+	readonly code?: string
+	readonly retryable: boolean
+
+	constructor(status: number, code?: string) {
+		super(`OpenAI OAuth token request failed with HTTP ${status}.`)
+		this.name = "OAuthTokenError"
+		this.status = status
+		this.code = code && OAUTH_ERROR_CODES.has(code) ? code : undefined
+		this.retryable =
+			status === 408 || status === 425 || status === 429 || status >= 500
+	}
+}
+
 const requestOpenAIOAuthTokens = async (options: {
 	clientId?: string
 	issuer?: string
@@ -464,7 +560,8 @@ const requestOpenAIOAuthTokens = async (options: {
 	if (options.originator !== undefined) {
 		headers.originator = options.originator
 	}
-	const response = await pickFetch(options.fetch)(
+	const response = await fetchWithSignal(
+		pickFetch(options.fetch),
 		resolveTokenUrl(issuer, options.tokenUrl),
 		{
 			method: "POST",
@@ -473,25 +570,35 @@ const requestOpenAIOAuthTokens = async (options: {
 				? new URLSearchParams(options.body).toString()
 				: JSON.stringify(options.body),
 			signal: options.signal,
+			redirect: "error",
 		},
+		options.signal,
 	)
-	const bodyText = await response.text()
+	let bodyText: string
+	try {
+		bodyText = await readBoundedText(response.body, 64 * 1024, options.signal)
+	} catch (error) {
+		if (!response.ok) throw new OAuthTokenError(response.status)
+		throw error
+	}
 
 	if (!response.ok) {
-		let detail = ""
+		let code: string | undefined
 		try {
 			const parsed = JSON.parse(bodyText)
 			if (isRecord(parsed)) {
-				const message =
-					parsed.error_description ?? parsed.message ?? parsed.detail
-				if (typeof message === "string") {
-					detail = ` ${message}`
-				}
+				const candidate =
+					typeof parsed.error === "string"
+						? parsed.error
+						: isRecord(parsed.error)
+							? parsed.error.code
+							: undefined
+				if (typeof candidate === "string") code = candidate
 			}
 		} catch {}
-		throw new Error(
-			`OpenAI OAuth token request failed with HTTP ${response.status}.${detail}`,
-		)
+		// Provider error descriptions may echo tokens, authorization codes or URL
+		// userinfo. Keep only a whitelisted machine code and HTTP status.
+		throw new OAuthTokenError(response.status, code)
 	}
 
 	try {
@@ -643,7 +750,15 @@ const resolveTargetUrl = (input: string, baseURL: string): string => {
 		pathname = pathname.slice(3)
 	}
 
-	return `${base.origin}${basePath}${pathname}${parsed.search}`
+	const target = new URL(`${base.origin}${basePath}${pathname}`)
+	target.search = base.search
+	// Request query values replace the base defaults for the same key; repeated
+	// request keys remain repeated and encoding is handled by URLSearchParams.
+	for (const key of new Set(parsed.searchParams.keys()))
+		target.searchParams.delete(key)
+	for (const [key, value] of parsed.searchParams)
+		target.searchParams.append(key, value)
+	return target.toString()
 }
 
 const readRequestParts = async (
@@ -666,10 +781,15 @@ const readRequestParts = async (
 				init?.body ??
 				(input.body == null
 					? undefined
-					: input.headers.get("content-type")?.includes("multipart/form-data")
+					: input.headers
+								.get("content-type")
+								?.split(";", 1)[0]
+								?.trim()
+								.toLowerCase() === "multipart/form-data"
 						? await input.clone().formData()
 						: await input.clone().text()),
 			signal: init?.signal ?? input.signal,
+			redirect: init?.redirect ?? input.redirect,
 		}
 	}
 
@@ -679,6 +799,7 @@ const readRequestParts = async (
 		headers: new Headers(init?.headers),
 		body: init?.body,
 		signal: init?.signal,
+		redirect: init?.redirect,
 	}
 }
 
@@ -851,15 +972,6 @@ type ResolveModelInfo = (
 	model: string,
 ) => Promise<CodexModelInfo | undefined>
 
-type ModelCatalogResult = {
-	models: CodexModelInfo[]
-	error?: Error
-}
-
-type ResolveModelCatalog = (
-	auth: OpenAIOAuthSession,
-) => Promise<ModelCatalogResult>
-
 const prepareResponsesRequestBody = async (
 	pathname: string,
 	headers: Headers,
@@ -868,27 +980,31 @@ const prepareResponsesRequestBody = async (
 	state: CodexResponsesState | undefined,
 	auth: OpenAIOAuthSession,
 	resolveModelInfo: ResolveModelInfo,
+	validateStateReferences: (body: Record<string, unknown>) => void,
 ): Promise<PreparedResponsesRequestBody> => {
 	if (!pathname.endsWith("/responses")) {
 		return { body }
 	}
-	const contentType = headers.get("content-type")
-	if (contentType && !contentType.includes("application/json")) {
+	const contentType = headers
+		.get("content-type")
+		?.split(";", 1)[0]
+		?.trim()
+		.toLowerCase()
+	if (contentType && contentType !== "application/json") {
 		return { body }
 	}
 	const bodyText = await decodeBody(body)
 	if (typeof bodyText !== "string") {
 		return { body }
 	}
+	let parsed: unknown
 	try {
-		const parsed = JSON.parse(bodyText)
-		if (
-			typeof parsed !== "object" ||
-			parsed === null ||
-			Array.isArray(parsed)
-		) {
-			return { body }
-		}
+		parsed = JSON.parse(bodyText)
+	} catch {
+		return { body }
+	}
+	if (!isRecord(parsed)) return { body }
+	{
 		const wantsStream = parsed.stream === true
 		const modelInfo =
 			typeof parsed.model === "string"
@@ -983,10 +1099,9 @@ const prepareResponsesRequestBody = async (
 			}
 		}
 
-		if (state?.requiresCachedState(normalized)) {
-			await state.waitForPendingCaptures()
-		}
-
+		// Captures advance synchronously with consumer reads. Never wait for all
+		// other active streams on this owner merely to resolve one predecessor.
+		validateStateReferences(normalized)
 		const expanded = state?.expandRequestBody(normalized) ?? normalized
 
 		return {
@@ -994,8 +1109,6 @@ const prepareResponsesRequestBody = async (
 			requestBody: expanded,
 			wantsStream,
 		}
-	} catch {
-		return { body }
 	}
 }
 
@@ -1003,25 +1116,111 @@ const captureResponsesState = (
 	response: Response,
 	requestBody: Record<string, unknown> | undefined,
 	state: CodexResponsesState | undefined,
+	limits?: SseLimits,
+	signal?: AbortSignal | null,
+	hooks?: {
+		context: ResponsesContext
+		completed?: CodexOAuthRuntimeSettings["onResponseCompleted"]
+		event?: CodexOAuthRuntimeSettings["onResponseEvent"]
+		error?: CodexOAuthRuntimeSettings["onResponseError"]
+	},
 ): Response => {
-	if (
-		state == null ||
-		requestBody == null ||
-		!response.ok ||
-		response.body == null
-	) {
-		return response
+	if (!requestBody || !response.ok || !response.body) return response
+	const reader = response.body.getReader()
+	const parser = new SseParser(limits)
+	const collector = new ResponseSseCollector(limits)
+	let settled = false
+	let captured = false
+	let settleCapture: () => void = () => undefined
+	const capture = new Promise<void>((resolve) => {
+		settleCapture = resolve
+	})
+	state?.trackPendingCapture(capture)
+	const finish = () => {
+		if (settled) return
+		settled = true
+		signal?.removeEventListener("abort", abort)
+		settleCapture()
 	}
-
-	const [returnedBody, cachedBody] = response.body.tee()
-	const capturePromise = collectCompletedResponseFromSse(cachedBody)
-		.then((completedResponse) => {
-			state.rememberResponse(completedResponse, requestBody)
-		})
-		.catch(() => undefined)
-	state.trackPendingCapture(capturePromise)
-
-	return new Response(returnedBody, {
+	const collect = (events: Iterable<import("./sse.js").ServerSentEvent>) => {
+		for (const event of events) {
+			if (hooks?.event && event.data) {
+				let parsed: unknown
+				try {
+					parsed = JSON.parse(event.data)
+				} catch {}
+				if (
+					isRecord(parsed) &&
+					(parsed.type === "codex.rate_limits" ||
+						event.event === "codex.rate_limits" ||
+						parsed.type === "codex.response.metadata" ||
+						event.event === "codex.response.metadata")
+				)
+					hooks.event(parsed, hooks.context)
+			}
+			collector.accept(event)
+		}
+		if (collector.terminal && !captured) {
+			captured = true
+			state?.rememberResponse(collector.finish(), requestBody)
+			hooks?.completed?.(collector.finish(), hooks.context)
+			settleCapture()
+		}
+	}
+	let controller: ReadableStreamDefaultController<Uint8Array>
+	const abort = () => {
+		if (settled) return
+		const reason = signal?.reason ?? new DOMException("Aborted", "AbortError")
+		finish()
+		void reader.cancel(reason).catch(() => undefined)
+		controller.error(reason)
+	}
+	const body = new ReadableStream<Uint8Array>(
+		{
+			start(value) {
+				controller = value
+				signal?.addEventListener("abort", abort, { once: true })
+				if (signal?.aborted) abort()
+			},
+			async pull(value) {
+				try {
+					const chunk = await readWithSignal(
+						reader,
+						signal,
+						limits?.idleTimeoutMs,
+					)
+					if (settled) return
+					if (chunk.done) {
+						collect(parser.finish())
+						collector.finish()
+						finish()
+						reader.releaseLock()
+						value.close()
+						return
+					}
+					collect(parser.push(chunk.value))
+					value.enqueue(chunk.value)
+					if (collector.terminal) {
+						finish()
+						void reader.cancel().catch(() => undefined)
+						value.close()
+					}
+				} catch (error) {
+					if (settled) return
+					finish()
+					if (!signal?.aborted) hooks?.error?.(error, hooks.context)
+					void reader.cancel(error).catch(() => undefined)
+					value.error(error)
+				}
+			},
+			cancel(reason) {
+				finish()
+				return reader.cancel(reason)
+			},
+		},
+		{ highWaterMark: 0 },
+	)
+	return new Response(body, {
 		status: response.status,
 		statusText: response.statusText,
 		headers: new Headers(response.headers),
@@ -1032,6 +1231,9 @@ const finalizeResponsesResponse = async (
 	response: Response,
 	prepared: PreparedResponsesRequestBody,
 	state: CodexResponsesState | undefined,
+	limits?: SseLimits,
+	signal?: AbortSignal | null,
+	hooks?: Parameters<typeof captureResponsesState>[5],
 ): Promise<Response> => {
 	if (
 		prepared.requestBody == null ||
@@ -1042,12 +1244,18 @@ const finalizeResponsesResponse = async (
 		return response
 	}
 
-	if (prepared.wantsStream) {
-		return captureResponsesState(response, prepared.requestBody, state)
-	}
+	const observed = captureResponsesState(
+		response,
+		prepared.requestBody,
+		state,
+		limits,
+		signal,
+		hooks,
+	)
+	if (prepared.wantsStream) return observed
 
-	const completed = await collectCompletedResponseFromSse(response.body)
-	state?.rememberResponse(completed, prepared.requestBody)
+	if (!observed.body) return observed
+	const completed = await collectCompletedResponseFromSse(observed.body, limits)
 	const headers = new Headers(response.headers)
 	headers.delete("content-encoding")
 	headers.delete("content-length")
@@ -1072,12 +1280,11 @@ const applyAuthHeaders = (
 	headers.delete("x-openai-fedramp")
 	headers.set("Authorization", `Bearer ${auth.accessToken}`)
 	headers.set("chatgpt-account-id", auth.accountId)
+	if (auth.isFedRamp === true) headers.set("x-openai-fedramp", "true")
 
-	// Codex's default client stamps `originator` + a codex-flavored User-Agent
-	// on every request (codex-rs default_client.rs default_headers). The
-	// X-OpenAI-Fedramp marker is deliberately NOT forwarded: codex-rs never
-	// emits it, so sending it flags the request as non-codex.
-	// Set only when not already present so overrides via settings.headers win.
+	// Account-routing metadata comes only from the selected trusted session.
+	// Caller headers must not be able to select another account or compliance route.
+	// Non-routing header overrides remain configurable.
 	if (!headers.has("originator")) {
 		headers.set("originator", DEFAULT_CODEX_ORIGINATOR)
 	}
@@ -1111,87 +1318,66 @@ const createModelCatalogResolver = (
 	fetch: FetchFunction,
 	baseURL: string,
 	settings: CodexOAuthRuntimeSettings,
-): ResolveModelCatalog => {
-	const cache = new Map<
-		string,
-		{ expiresAt: number; result: ModelCatalogResult }
-	>()
-	const inflight = new Map<string, Promise<ModelCatalogResult>>()
-
-	return async (auth) => {
-		const cacheKey = `${auth.accountId}:${auth.isFedRamp === true}`
-		const cached = cache.get(cacheKey)
-		if (cached && cached.expiresAt > Date.now()) {
-			return cached.result
-		}
-
-		let loading = inflight.get(cacheKey)
-		if (!loading) {
-			loading = (async (): Promise<ModelCatalogResult> => {
-				try {
-					const models = await fetchCodexModelCatalog(
-						{
-							request: async (path, init) => {
-								const headers = new Headers(settings.headers)
-								new Headers(init?.headers).forEach((value, key) => {
-									headers.set(key, value)
-								})
-								applyAuthHeaders(
-									headers,
-									auth,
-									undefined,
-									settings.terminalToken,
-								)
-								return fetch(
-									new URL(path.replace(/^\//, ""), `${baseURL}/`).toString(),
-									{
-										...init,
-										method: init?.method ?? "GET",
-										headers,
-									},
-								)
-							},
-						},
-						{
-							// The registry version lookup is unauthenticated
-							// metadata about the Codex CLI package. Honoring a
-							// caller-supplied fetch first keeps server-side behaviour
-							// (e.g. openai-oauth test/server handlers) intact; in the
-							// default Node runtime there is no custom fetch, so we
-							// must not let this unauthenticated lookup ride an
-							// auth-proxied account fetch.
-							fetchImpl: settings.fetch ?? globalThis.fetch?.bind(globalThis),
-							codexVersion: settings.codexVersion,
-						},
-					)
-					const result = { models }
-					cache.set(cacheKey, {
-						expiresAt: Date.now() + MODEL_CATALOG_TTL_MS,
-						result,
-					})
-					return result
-				} catch (error) {
-					const result = {
-						models: [],
-						error:
-							error instanceof Error
-								? error
-								: new Error("Failed to load models from Codex."),
-					}
-					cache.set(cacheKey, {
-						expiresAt: Date.now() + MODEL_CATALOG_FAILURE_TTL_MS,
-						result,
-					})
-					return result
-				}
-			})().finally(() => {
-				inflight.delete(cacheKey)
+) => {
+	const maxStaleMs = settings.modelCatalogMaxStaleMs ?? 30 * 60 * 1000
+	if (!Number.isFinite(maxStaleMs) || maxStaleMs < 0)
+		throw new Error(
+			"modelCatalogMaxStaleMs must be a nonnegative finite number.",
+		)
+	const field = (value: unknown): string | null =>
+		typeof value === "string" && value.length > 0 && value.length <= 256
+			? value
+			: null
+	return createModelCatalogCache({
+		maxStaleMs,
+		signal: settings.signal,
+		identity: (auth) => {
+			const claims = [auth.idToken, auth.accessToken].map((token) => {
+				const parsed = parseJwtClaims(token)?.["https://api.openai.com/auth"]
+				return isRecord(parsed) ? parsed : {}
 			})
-			inflight.set(cacheKey, loading)
-		}
-
-		return loading
-	}
+			const user =
+				claims
+					.map((claim) => field(claim.chatgpt_user_id) ?? field(claim.user_id))
+					.find(Boolean) ?? null
+			const plan =
+				claims.map((claim) => field(claim.chatgpt_plan_type)).find(Boolean) ??
+				null
+			return JSON.stringify([
+				baseURL,
+				auth.accountId,
+				auth.isFedRamp === true,
+				user,
+				plan,
+			])
+		},
+		fetch: (auth, version) =>
+			fetchCodexModelCatalogSnapshot(
+				{
+					request: async (path, init) => {
+						const headers = new Headers(settings.headers)
+						new Headers(init?.headers).forEach((value, key) => {
+							headers.set(key, value)
+						})
+						applyAuthHeaders(headers, auth, version, settings.terminalToken)
+						const response = await fetch(resolveTargetUrl(path, baseURL), {
+							...init,
+							method: init?.method ?? "GET",
+							headers,
+							// Shared discovery never weakens another caller's redirect restriction.
+							redirect: "error",
+						})
+						settings.onModelCatalogResponse?.(response, { session: auth })
+						return response
+					},
+				},
+				{
+					codexVersion: version,
+					timeoutMs: settings.modelCatalogTimeoutMs,
+					signal: settings.signal,
+				},
+			),
+	})
 }
 
 const resolveAuth = async (
@@ -1206,22 +1392,42 @@ const resolveAuth = async (
 
 const createCodexOAuthFetch = (
 	settings: CodexOAuthRuntimeSettings,
-): FetchFunction => {
+): {
+	fetch: FetchFunction
+	getModelCatalog: NonNullable<OpenAIOAuthTransport["getModelCatalog"]>
+} => {
+	validateTimeout(settings.modelCatalogTimeoutMs, "modelCatalogTimeoutMs")
+	validateTimeout(settings.requestTimeoutMs, "requestTimeoutMs")
+	validateTimeout(settings.streamIdleTimeoutMs, "streamIdleTimeoutMs")
 	const fetch = pickFetch(settings.fetch)
 	const baseURL = resolveBaseURL(settings.baseURL)
-	const responsesState =
-		settings.responsesState === false
-			? undefined
-			: (settings.responsesState ?? new CodexResponsesState())
-	const resolveModelCatalog = createModelCatalogResolver(
-		fetch,
-		baseURL,
-		settings,
-	)
-	const resolveModelInfo: ResolveModelInfo = async (auth, model) =>
-		(await resolveModelCatalog(auth)).models.find(
-			(entry) => entry.slug === model,
-		)
+	// Cache keys exclude access tokens: a refresh is not an ownership change.
+	// In-flight responses retain their own state reference, so an older owner's
+	// completion cannot populate a different owner's cache after auth switches.
+	const states = new Map<string, CodexResponsesState>()
+	let suppliedStateOwner: string | undefined
+	const stateFor = (
+		auth: OpenAIOAuthSession,
+	): CodexResponsesState | undefined => {
+		if (settings.responsesState === false) return undefined
+		const key = JSON.stringify([auth.accountId, auth.isFedRamp === true])
+		let state = states.get(key)
+		if (!state) {
+			state =
+				settings.responsesState && suppliedStateOwner === undefined
+					? settings.responsesState
+					: new CodexResponsesState()
+			state.claimOwner(key)
+			if (suppliedStateOwner === undefined) suppliedStateOwner = key
+			if (states.size >= 8) {
+				const oldest = states.keys().next().value
+				if (oldest !== undefined) states.delete(oldest)
+			}
+			states.set(key, state)
+		}
+		return state
+	}
+	const modelCatalog = createModelCatalogResolver(fetch, baseURL, settings)
 	// Resolved once (mirrors the npm-registry lookup the model catalog already
 	// performs) and stamped onto the default Codex User-Agent from then on.
 	// Pre-resolution requests keep the pinned fallback UA; a literal
@@ -1232,6 +1438,8 @@ const createCodexOAuthFetch = (
 		codexVersionPromise ??= resolveCodexClientVersion({
 			codexVersion: settings.codexVersion,
 			fetchImpl: settings.fetch ?? globalThis.fetch?.bind(globalThis),
+			timeoutMs: settings.modelCatalogTimeoutMs,
+			signal: settings.signal,
 		})
 			.then((version) => {
 				resolvedCodexVersion = version
@@ -1241,133 +1449,358 @@ const createCodexOAuthFetch = (
 				resolvedCodexVersion = DEFAULT_CODEX_CLIENT_VERSION
 				return resolvedCodexVersion
 			})
+			.finally(() => {
+				codexVersionPromise = undefined
+			})
 		return codexVersionPromise
 	}
 
-	return async (input, init) => {
-		const request = await readRequestParts(input, init)
-		const targetUrl = resolveTargetUrl(request.url, baseURL)
-		const target = new URL(targetUrl)
-		const auth = await resolveAuth(settings.auth)
-		const userAgentResolution =
-			resolvedCodexVersion !== undefined ? undefined : resolveUserAgentVersion()
-		if (
-			(request.method ?? "GET").toUpperCase() === "GET" &&
-			target.pathname.endsWith("/models") &&
-			!target.searchParams.has("client_version")
-		) {
-			const catalog = await resolveModelCatalog(auth)
-			const models = catalog.models.filter(isPublicCodexModel)
-			if (models.length === 0) {
-				return Response.json(
-					{
-						error: {
-							message:
-								catalog.error?.message ?? "Failed to load models from Codex.",
+	const getModelCatalog: NonNullable<
+		OpenAIOAuthTransport["getModelCatalog"]
+	> = async (options = {}) => {
+		options.signal?.throwIfAborted()
+		settings.signal?.throwIfAborted()
+		if (options.cacheOnly && options.refresh)
+			throw new Error("cacheOnly and refresh cannot both be enabled.")
+		const cached = modelCatalog.copy(modelCatalog.peek(), options)
+		if (options.cacheOnly) return cached
+		const scope = createOperationScope(
+			settings.requestTimeoutMs,
+			[settings.signal, options.signal],
+			"Catalog inspection",
+		)
+		try {
+			const auth = await waitWithSignal(
+				resolveAuth(settings.auth),
+				scope.signal,
+			)
+			const version = await waitWithSignal(
+				resolveUserAgentVersion(),
+				scope.signal,
+			)
+			const capture = modelCatalog.select(auth, version)
+			const snapshot = await waitWithSignal(
+				modelCatalog.resolve(capture, options.refresh),
+				scope.signal,
+			)
+			return modelCatalog.copy(snapshot, options)
+		} finally {
+			scope.dispose()
+		}
+	}
+	const authenticatedFetch: FetchFunction = async (input, init) => {
+		const scope = createOperationScope(
+			settings.requestTimeoutMs,
+			[
+				settings.signal,
+				init?.signal ?? (input instanceof Request ? input.signal : undefined),
+			],
+			"Request",
+		)
+		const signal = scope.signal
+		let bodyOwnsScope = false
+		try {
+			if (signal?.aborted)
+				throw signal.reason ?? new DOMException("Aborted", "AbortError")
+			const request = await waitWithSignal(
+				readRequestParts(input, init),
+				signal,
+			)
+			request.signal = signal
+			const targetUrl = resolveTargetUrl(request.url, baseURL)
+			const target = new URL(targetUrl)
+			const auth = await waitWithSignal(resolveAuth(settings.auth), signal)
+			const responsesState = stateFor(auth)
+			const userAgentResolution = resolveUserAgentVersion()
+			const catalogCapture = modelCatalog.select(
+				auth,
+				await waitWithSignal(userAgentResolution, signal),
+			)
+			const resolveModelInfo: ResolveModelInfo = async (_auth, model) =>
+				(await modelCatalog.resolve(catalogCapture)).models.find(
+					(entry) => entry.slug === model,
+				)
+			if (
+				(request.method ?? "GET").toUpperCase() === "GET" &&
+				target.pathname.endsWith("/models") &&
+				!target.searchParams.has("client_version")
+			) {
+				const catalog = await waitWithSignal(
+					modelCatalog.resolve(catalogCapture),
+					signal,
+				)
+				const models = catalog.models.filter(isPublicCodexModel)
+				if (models.length === 0) {
+					return Response.json(
+						{
+							error: {
+								message:
+									modelCatalog.error(catalogCapture)?.message ??
+									"Failed to load models from Codex.",
+							},
 						},
-					},
-					{ status: 502 },
+						{ status: 502 },
+					)
+				}
+				return Response.json({
+					object: "list",
+					data: [
+						...models.map((model) => ({
+							id: model.slug,
+							object: "model",
+							created: 0,
+							owned_by: "codex-oauth",
+						})),
+						...(models.some((model) => model.slug === CODEX_IMAGE_MODEL)
+							? []
+							: [
+									{
+										id: CODEX_IMAGE_MODEL,
+										object: "model",
+										created: 0,
+										owned_by: "codex-oauth",
+									},
+								]),
+					],
+				})
+			}
+
+			const headers = new Headers(settings.headers)
+			request.headers.forEach((value, key) => {
+				headers.set(key, value)
+			})
+			// Codex CLI sends one `session-id` per conversation (the thread id used
+			// for prompt-cache affinity). The settings-level session id is only a
+			// fallback device identity for pools that don't already stamp a
+			// conversation-scoped `session-id` per request; any per-request value
+			// merged above always wins. Underscore `session_id` is a settings-side
+			// configuration key, never sent verbatim.
+			const configuredSessionId =
+				settings.headers?.session_id ?? settings.headers?.["session-id"]
+			if (configuredSessionId !== undefined) {
+				headers.delete("session_id")
+				if (!headers.has("session-id")) {
+					headers.set("session-id", configuredSessionId)
+				}
+			}
+			// Underscore installation_id is a settings-side key too: it belongs only
+			// in the body's client_metadata (added in prepareResponsesRequestBody),
+			// never as a literal request header.
+			headers.delete("installation_id")
+			// Await the one-time version resolution so the first request already
+			// stamps the fully-resolved UA (originator + version + per-account
+			// terminalToken) instead of the build-frozen DEFAULT_CODEX_USER_AGENT —
+			// which would otherwise drop terminalToken on the fallback path.
+			await waitWithSignal(Promise.resolve(userAgentResolution), signal)
+			applyAuthHeaders(
+				headers,
+				auth,
+				resolvedCodexVersion,
+				settings.terminalToken,
+			)
+			// Codex's built-in OpenAI provider carries a static `version` header set to
+			// its build version on every request (model-provider-info/src/lib.rs:474
+			// http_headers → applied to /responses, /models, ws, everything). Matches
+			// the UA's version segment — never let it float off resolvedCodexVersion.
+			if (!headers.has("version")) {
+				headers.set(
+					"version",
+					resolvedCodexVersion ?? DEFAULT_CODEX_CLIENT_VERSION,
 				)
 			}
-			return Response.json({
-				object: "list",
-				data: [
-					...models.map((model) => ({
-						id: model.slug,
-						object: "model",
-						created: 0,
-						owned_by: "codex-oauth",
-					})),
-					...(models.some((model) => model.slug === CODEX_IMAGE_MODEL)
-						? []
-						: [
-								{
-									id: CODEX_IMAGE_MODEL,
-									object: "model",
-									created: 0,
-									owned_by: "codex-oauth",
-								},
-							]),
-				],
-			})
-		}
-
-		const headers = new Headers(settings.headers)
-		request.headers.forEach((value, key) => {
-			headers.set(key, value)
-		})
-		// Codex CLI sends one `session-id` per conversation (the thread id used
-		// for prompt-cache affinity). The settings-level session id is only a
-		// fallback device identity for pools that don't already stamp a
-		// conversation-scoped `session-id` per request; any per-request value
-		// merged above always wins. Underscore `session_id` is a settings-side
-		// configuration key, never sent verbatim.
-		const configuredSessionId =
-			settings.headers?.session_id ?? settings.headers?.["session-id"]
-		if (configuredSessionId !== undefined) {
-			headers.delete("session_id")
-			if (!headers.has("session-id")) {
-				headers.set("session-id", configuredSessionId)
+			// Codex sets Accept: text/event-stream only on the /responses streaming
+			// endpoint; /models and image calls get no explicit Accept header.
+			if (target.pathname.endsWith("/responses") && !headers.has("accept")) {
+				headers.set("Accept", "text/event-stream")
 			}
-		}
-		// Underscore installation_id is a settings-side key too: it belongs only
-		// in the body's client_metadata (added in prepareResponsesRequestBody),
-		// never as a literal request header.
-		headers.delete("installation_id")
-		// Await the one-time version resolution so the first request already
-		// stamps the fully-resolved UA (originator + version + per-account
-		// terminalToken) instead of the build-frozen DEFAULT_CODEX_USER_AGENT —
-		// which would otherwise drop terminalToken on the fallback path.
-		await userAgentResolution
-		applyAuthHeaders(
-			headers,
-			auth,
-			resolvedCodexVersion,
-			settings.terminalToken,
-		)
-		// Codex's built-in OpenAI provider carries a static `version` header set to
-		// its build version on every request (model-provider-info/src/lib.rs:474
-		// http_headers → applied to /responses, /models, ws, everything). Matches
-		// the UA's version segment — never let it float off resolvedCodexVersion.
-		if (!headers.has("version")) {
-			headers.set(
-				"version",
-				resolvedCodexVersion ?? DEFAULT_CODEX_CLIENT_VERSION,
+			const preparedImage = await waitWithSignal(
+				prepareCodexImageRequest(
+					target.pathname,
+					headers,
+					request.body,
+					settings.imageLimits,
+				),
+				signal,
 			)
-		}
-		// Codex sets Accept: text/event-stream only on the /responses streaming
-		// endpoint; /models and image calls get no explicit Accept header.
-		if (target.pathname.endsWith("/responses") && !headers.has("accept")) {
-			headers.set("Accept", "text/event-stream")
-		}
-		const preparedImage = await prepareCodexImageRequest(
-			target.pathname,
-			headers,
-			request.body,
-		)
-		if (preparedImage.response) {
-			return preparedImage.response
-		}
+			if (preparedImage.response) {
+				return preparedImage.response
+			}
 
-		const preparedBody = await prepareResponsesRequestBody(
-			target.pathname,
-			headers,
-			preparedImage.body,
-			settings,
-			responsesState,
-			auth,
-			resolveModelInfo,
-		)
+			const preparedBody = await waitWithSignal(
+				prepareResponsesRequestBody(
+					target.pathname,
+					headers,
+					preparedImage.body,
+					settings,
+					responsesState,
+					auth,
+					resolveModelInfo,
+					(body) => {
+						const predecessor =
+							typeof body.previous_response_id === "string"
+								? body.previous_response_id
+								: undefined
+						const items = Array.isArray(body.input)
+							? body.input
+									.filter(isRecord)
+									.filter(
+										(item) =>
+											item.type === "item_reference" &&
+											typeof item.id === "string",
+									)
+							: []
+						for (const other of states.values()) {
+							if (other === responsesState) continue
+							if (
+								(predecessor &&
+									!responsesState?.hasResponse(predecessor) &&
+									other.hasResponse(predecessor)) ||
+								items.some(
+									(item) =>
+										!responsesState?.hasItem(item.id as string) &&
+										other.hasItem(item.id as string),
+								)
+							) {
+								throw new Error(
+									"Continuation state belongs to a different authenticated account.",
+								)
+							}
+						}
+					},
+				),
+				signal,
+			)
 
-		const response = await fetch(target.toString(), {
-			method: request.method ?? init?.method,
-			headers,
-			body: preparedBody.body,
-			signal: request.signal ?? undefined,
-		})
+			const dispatchInit: RequestInit = {
+				method: request.method ?? init?.method,
+				redirect: request.redirect,
+				headers,
+				body: preparedBody.body,
+				signal: request.signal ?? undefined,
+			}
+			if (signal?.aborted)
+				throw signal.reason ?? new DOMException("Aborted", "AbortError")
+			const dispatch =
+				preparedBody.requestBody && settings.executeResponses
+					? settings.executeResponses(target.toString(), dispatchInit, auth)
+					: fetch(target.toString(), dispatchInit)
+			void dispatch.then(
+				(late) => {
+					if (signal.aborted)
+						void late.body?.cancel(signal.reason).catch(() => undefined)
+				},
+				() => undefined,
+			)
+			const response = await waitWithSignal(dispatch, signal)
+			modelCatalog.observe(
+				catalogCapture,
+				response.headers.get("x-models-etag"),
+			)
 
-		return finalizeResponsesResponse(response, preparedBody, responsesState)
+			const finalized = await finalizeResponsesResponse(
+				response,
+				preparedBody,
+				responsesState,
+				{
+					...settings.responseLimits,
+					idleTimeoutMs:
+						settings.streamIdleTimeoutMs ??
+						settings.responseLimits?.idleTimeoutMs,
+				},
+				signal,
+				preparedBody.requestBody
+					? {
+							context: {
+								session: auth,
+								request: preparedBody.requestBody,
+								headers: new Headers(dispatchInit.headers),
+							},
+							completed: settings.onResponseCompleted,
+							event: (event, context) => {
+								if (
+									event.type === "codex.response.metadata" &&
+									isRecord(event.headers)
+								) {
+									for (const [name, value] of Object.entries(event.headers)) {
+										if (name.toLowerCase() === "x-models-etag")
+											modelCatalog.observe(catalogCapture, value)
+									}
+								}
+								settings.onResponseEvent?.(event, context)
+							},
+							error: settings.onResponseError,
+						}
+					: undefined,
+			)
+			if (!finalized.body) return finalized
+			bodyOwnsScope = true
+			return retainResponseScope(finalized, scope)
+		} finally {
+			if (!bodyOwnsScope) scope.dispose()
+		}
 	}
+	return { fetch: authenticatedFetch, getModelCatalog }
+}
+
+/** Keep a total request deadline alive until the consumer finishes or cancels. */
+const retainResponseScope = (
+	response: Response,
+	scope: ReturnType<typeof createOperationScope>,
+): Response => {
+	if (!response.body) {
+		scope.dispose()
+		return response
+	}
+	const reader = response.body.getReader()
+	let done = false
+	let controller: ReadableStreamDefaultController<Uint8Array>
+	const finish = () => {
+		if (done) return
+		done = true
+		scope.signal.removeEventListener("abort", abort)
+		scope.dispose()
+	}
+	const abort = () => {
+		if (done) return
+		finish()
+		void reader.cancel(scope.signal.reason).catch(() => undefined)
+		controller.error(scope.signal.reason)
+	}
+	const stream = new ReadableStream<Uint8Array>(
+		{
+			start(value) {
+				controller = value
+				scope.signal.addEventListener("abort", abort, { once: true })
+				if (scope.signal.aborted) abort()
+			},
+			async pull(value) {
+				try {
+					const chunk = await readWithSignal(reader, scope.signal)
+					if (done) return
+					if (chunk.done) {
+						finish()
+						reader.releaseLock()
+						value.close()
+					} else value.enqueue(chunk.value)
+				} catch (error) {
+					if (done) return
+					finish()
+					void reader.cancel(error).catch(() => undefined)
+					value.error(error)
+				}
+			},
+			cancel(reason) {
+				finish()
+				return reader.cancel(reason)
+			},
+		},
+		{ highWaterMark: 0 },
+	)
+	return new Response(stream, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: response.headers,
+	})
 }
 
 const resolveOpenAICompatibleUrl = (path: string, baseURL: string): string => {
@@ -1384,14 +1817,17 @@ const resolveOpenAICompatibleUrl = (path: string, baseURL: string): string => {
 
 export const createOpenAIOAuthTransport = (
 	settings: OpenAIOAuthTransportOptions,
-): OpenAIOAuthTransport => {
+): OpenAIOAuthTransport & {
+	getModelCatalog: NonNullable<OpenAIOAuthTransport["getModelCatalog"]>
+} => {
 	const baseURL = resolveOpenAIBaseURL(settings.openAIBaseURL)
-	const fetch = createCodexOAuthFetch(settings)
+	const { fetch, getModelCatalog } = createCodexOAuthFetch(settings)
 
 	return {
 		kind: "openai-compatible",
 		baseURL,
 		fetch,
+		getModelCatalog,
 		request: (path, init) =>
 			fetch(resolveOpenAICompatibleUrl(path, baseURL), init),
 	}

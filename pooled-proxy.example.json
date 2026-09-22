@@ -1,0 +1,21 @@
+{
+	"host": "127.0.0.1",
+	"port": 10531,
+	"diagnostics": false,
+	"healthRefreshMs": true,
+	"retryOnOtherAccount": false,
+	"accounts": [
+		{
+			"name": "alice",
+			"authFilePath": "/home/claude_user/.codex/accounts/alice.json",
+			"proxyEnv": "ALICE_PROXY_URL",
+			"transport": "http"
+		},
+		{
+			"name": "second-account",
+			"authFilePath": "/absolute/path/to/second-account.json",
+			"proxyEnv": "SECOND_ACCOUNT_PROXY_URL",
+			"transport": "http"
+		}
+	]
+}

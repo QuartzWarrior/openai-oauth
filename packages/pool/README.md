@@ -1,8 +1,8 @@
 # @openai-oauth/pool
 
-[Docs](https://github.com/EvanZhouDev/openai-oauth#typescript-sdk) | [GitHub](https://github.com/EvanZhouDev/openai-oauth) | [npm](https://www.npmjs.com/package/@openai-oauth/pool)
+[Docs](https://github.com/EvanZhouDev/openai-oauth#typescript-sdk) | [GitHub](https://github.com/EvanZhouDev/openai-oauth)
 
-Run many ChatGPT accounts as one: per-account proxies, per-account installation ids, least-busy + health-aware load balancing, and full request parallelism.
+An unofficial, account-scoped OAuth adapter with bounded request admission and health-aware scheduling. Use only accounts and requests you are authorized to operate. Compatibility tests do not establish exact CLI equivalence, anonymity, or live-provider capacity.
 
 ```bash
 npm i @openai-oauth/pool
@@ -10,189 +10,145 @@ npm i @openai-oauth/pool
 
 ## Quickstart
 
-Log each account in to its own auth file (one per account):
+Create a separate credential file for each authorized account. Treat these files and any proxy credentials as secrets.
 
 ```bash
-npx openai-oauth login --auth-file ~/.codex/accounts/alice.json
-npx openai-oauth login --auth-file ~/.codex/accounts/bob.json
+npx openai-oauth login --auth-file /absolute/path/account-a.json
+npx openai-oauth login --auth-file /absolute/path/account-b.json
 ```
-
-Then pool them. The pool is a drop-in `OpenAIOAuth` credential source, so it works with every client adapter unchanged:
 
 ```ts
 import { createOpenAIPool } from "@openai-oauth/pool";
 import { createOpenAIOptions } from "@openai-oauth/openai-client";
 import OpenAI from "openai";
 
-const pool = createOpenAIPool({
-	accounts: [
-		{
-			authFilePath: "~/.codex/accounts/alice.json",
-			proxy: "http://user:pass@proxy-a.example:8080",
-			installationId: "device-id-for-alice",
-		},
-		{
-			authFilePath: "~/.codex/accounts/bob.json",
-			proxy: "socks5h://user:pass@proxy-b.example:1080",
-			installationId: "device-id-for-bob",
-		},
-	],
+const pool = await createOpenAIPool({
+    accounts: [
+        { name: "a", authFilePath: "/absolute/path/account-a.json" },
+        { name: "b", authFilePath: "/absolute/path/account-b.json" },
+    ],
+    maxInflightPerAccount: 128,
+    maxQueuedRequests: 1024,
+    queueTimeoutMs: 300_000,
 });
 
 const client = new OpenAI(createOpenAIOptions(pool));
-
 const result = await client.responses.create({
-	model: "gpt-5.4-mini",
-	input: "Hello!",
+    model: "gpt-5.4-mini",
+    input: "Hello!",
 });
+
+await pool.destroy();
 ```
 
-Or with Vercel AI SDK:
+`createOpenAIPool` is asynchronous. Consume or cancel response bodies so their in-flight leases can be released.
 
-```ts
-import { createOpenAIOAuth } from "@openai-oauth/ai-sdk";
-import { generateText } from "ai";
+## Ownership and continuation
 
-const openai = createOpenAIOAuth(pool);
+- Each configured account has separate credential loading, response state and HTTP transport resources. HTTP, WebSocket and public session loading share the account's credential-loading primitive.
+- A predecessor response ID binds a continuation to its recorded owner, even when the new input differs. Identical-request affinity is a scheduling optimization, not proof of conversation ownership.
+- Unknown/expired ownership fails explicitly. Removing an unknown `previous_response_id` does **not** reconstruct history.
+- Quota/authentication failures are returned rather than retried under another account. `retryOnOtherAccount` is retained as a deprecated compatibility option; it does not enable quota failover.
+- No migration clears another account's response cache. To begin an independent request, supply complete authorized input without a predecessor ID.
+- Pool ownership indexes and core response caches are bounded and in-memory. Restart or eviction can make an old continuation unavailable.
 
-const result = await generateText({
-	model: openai("gpt-5.4-mini"),
-	prompt: "Hello!",
-});
-```
+For direct `pool.fetch` callers, optional `x-pool-conversation-id` and `x-pool-turn-id` headers express application-defined conversation and turn boundaries. These control headers are removed before forwarding upstream. Keep them scoped to the caller's authorized context; they are not authentication. Without an explicit turn ID, the pool does not treat a conversation-wide TTL as a turn boundary or invent turn telemetry.
 
-## Full isolation per account
+A pool instance is **not** a multi-tenant authorization boundary. The caller must authenticate users and decide which accounts and histories they may access. SDK adapters may normalize and cache requests before the pool; this is distinct from direct pool calls. The stateless HTTP facade intentionally rejects continuation IDs and item references.
 
-Every account in the pool is kept fully separate:
+## Network routing
 
-| Concern | Isolation |
-| --- | --- |
-| Credentials | Its own `authFilePath`; tokens are loaded, refreshed and saved per account, with a per-account refresh lock so concurrent requests trigger exactly one refresh. |
-| Network | Its own `proxy` — each account gets a dedicated undici `ProxyAgent`, so connections, TLS sessions and proxy credentials never mix. |
-| Device identity | Its own `installationId`, persisted into the account's auth file on first run so the same "device" survives restarts. Sent only where codex sends it — the body's `client_metadata` — never as a literal header, never embedded in other ids. |
-| Wire identity | Mirrors Codex CLI exactly: bare v4-UUID `session-id` rotated per conversation (thread-id shape — never a composite exposing the installation id), `thread-id` + `x-client-request-id` mirroring, `prompt_cache_key`, body `client_metadata`, `originator: codex_cli_rs`, `Accept: text/event-stream`, and `User-Agent: codex_cli_rs/<latest-release> (Linux <kernel>; x86_64) unknown`. The `unknown` terminal token matches a headless codex TUI: codex_terminal_detection's interactive probes (`TERM_PROGRAM`, `WEZTERM_VERSION`, …) are never set server-side, and the `TERM`-echo only fires for the interactive `codex`/`codex exec` front-ends (verified against a live codex 0.154 capture). |
-| Replay chains | Its own transport state — `previous_response_id` chains are pinned to the account that started them, so server-side replay state never crosses accounts. |
-
-With `rotateIdentity` (default) each account derives a fresh, stable device id per conversation from its `installationId` — matching Codex CLI's one-session-id-per-conversation lifecycle. A static header value sent on every request is a fingerprint; rotation removes it.
-
-Each account's **User-Agent** is *also* a stable per-account signal. By default every account sends the uniform headless-TUI token `codex_cli_rs/<ver> (Linux <kernel>; x86_64) unknown` — the dominant, safest shape for a server-side pool. To spread accounts over distinct-but-plausible clients, set `varyUserAgent: true` (pins a stable token per account, derived from its `installationId`) or `terminalToken: "…"` (explicit). Every candidate is a terminal token codex_terminal_detection can *genuinely* emit on a headless **Linux** host — `unknown`, the tmux/screen/xterm `TERM`-echoes, `kitty`, `WezTerm/<build>`, `vscode/<ver>` (a `code tunnel` server) — and nothing mac/Windows-only, so no account ever claims a terminal a Linux box can't have. The choice is pinned per account and identical across HTTP and websocket, because a real install stamps one UA everywhere.
-
-Two codex headers are deliberately handled with nuance rather than blanket-emitted:
-
-- **`x-codex-window-id`** — codex's window identity is non-optional: `CodexResponsesMetadata::client_metadata()` always emits it and `compatibility_headers()` always sends the header, in the form `<thread_id>:<window_number>` (the TUI/memories mint it as `format!("{thread_id}:{n}")`, first window `:0`). A pool account serves each conversation as codex's single long-lived window, so we derive `x-codex-window-id` as `<rotated-thread-id>:0` per conversation and emit it on the websocket upgrade header and in body/frame `client_metadata` exactly as codex does. It is never invented per-request — the per-conversation thread id anchors it, matching codex's `<thread_id>:<n>` shape.
-- **`x-codex-turn-metadata`** — codex emits a bounded form only when a turn has full request identity plus turn metadata; the unbounded tool-inventory form stays in `client_metadata` only. We leave it off unless the caller configures it, since a pool has no genuine turn metadata to echo.
-
-## Websocket transport
-
-Set `transport: "websocket"` on an account to carry its `/responses` traffic over Codex's realtime websocket wire instead of HTTP:
+An account may configure an HTTP(S) proxy:
 
 ```ts
 {
-	accounts: [
-		{
-			authFilePath: "~/.codex/accounts/alice.json",
-			proxy: "socks5h://proxy-a.example:1080",
-			transport: "websocket",
-		},
-	],
+    authFilePath: "/absolute/path/account-a.json",
+    proxy: "http://user:password@proxy.example:8080",
 }
 ```
 
-Each websocket account keeps one persistent connection per conversation (per account + session id + access token, rebound on token refresh), warms it with a `generate: false` `response.create`, keeps it alive with protocol-level ping/pong exactly like codex (an RFC 6455 control ping via undici — never an app-level `{"type":"ping"}` frame, which no genuine codex client emits), tears it down after 60s idle, and reuses prior turns as `input_text.delta` frames when a request extends the previous input. The upgrade authenticates with `Authorization`/`chatgpt-account-id` headers like codex's HTTP requests (never a query token) and every `response.create` carries codex's wire identity (`session-id`/`thread-id`/`x-client-request-id` handshake ids + `client_metadata` with installation/session/thread ids, `originator`, a dynamic User-Agent whose trailing terminal token is detected from the environment like `codex_terminal_detection`, `OpenAI-Beta: responses_websockets=2026-02-06`, permessage-deflate). Any websocket failure — handshake, timeout, mid-stream error — falls back to plain HTTP for that request and demotes the account to HTTP permanently, so a broken websocket never breaks a request HTTP could serve. Requires `undici` (Node.js ≥ 20); lazily imported like the proxy agent.
+The package uses a dedicated undici `ProxyAgent` on Node.js 20.18.1 or newer. Unsupported protocols or runtimes without a working dispatcher fail closed. In particular, a Bun undici stub lacking `dispatch` is not accepted merely because its missing `close` method can be guarded. SOCKS is not implemented by this adapter; use a separately supplied, tested proxy-aware `fetch` if needed.
 
-The installation id each account reports (in `client_metadata` and the `x-codex-installation-id` body field) defaults to the per-account id persisted in that account's `auth.json` (generated on first run so the "device" survives restarts), keeping accounts fully isolated. You can pin an exact id per account via `installationId` in config. Because codex's genuine CLI on a machine has exactly one install, its standalone `~/.codex/installation_id` identifies *that one device* — so it's never claimed by default. If you want one account to impersonate the real CLI sharing the machine, opt that single account in with `preferNativeInstallationId: true`; enabling it on more than one account would spread one machine-id across many "devices", which real codex never does.
+`fetch` explicitly supplies the account's network implementation. `refreshFetch` optionally supplies a separate refresh route; otherwise refresh uses the account's data-path route. No global organization/project environment variables are implicitly imported into every account.
 
-## Load balancing
+A WebSocket configuration with a proxy or custom fetch deliberately uses HTTP when the WebSocket implementation cannot honor that route. It must not silently connect directly. Account-routing headers, including the FedRAMP flag, are rebuilt from the selected trusted session rather than arbitrary caller overrides.
 
-Picks combine least-busy balancing with health tracking:
+## Streaming and WebSocket behavior
 
-1. **Least busy** — the account with the lowest in-flight request count wins (reservations are made synchronously at pick time, so bursts of parallel requests spread across all accounts instead of piling onto the first idle one). `weight` biases the share: an account with `weight: 2` takes roughly twice the load of `weight: 1`.
-2. **Health tracking** — `429`/`401`/`403` responses put the account into cooldown (honoring `Retry-After`, otherwise exponential backoff). Cooling accounts are skipped; if every account is cooling, the request waits for the earliest recovery instead of failing.
-3. **Utilization** — Codex rate-window usage headers (`x-codex-primary-used-percent` / `x-codex-secondary-used-percent`) are tracked per account and used to break least-busy ties (the less-utilized account wins). The latest snapshot is exposed per account as `codex` in `pool.stats()`.
+Set `transport: "websocket"` only where the available connector supports the intended route. The protocol bridge shares HTTP request normalization and response finalization, including `stream: false` aggregation.
 
-Sequential turns of the same conversation (same model + instructions + input, or a `previous_response_id` chain) are pinned back to the account that served them. Parallel duplicates are spread across accounts.
+- Complete response event envelopes are preserved in SSE output.
+- A connection serializes full exchanges, including warmup. Reuse requires a successful eligible predecessor and compatible request properties/history.
+- Close, error and abort settle pending operations. Buffer and connection budgets limit accumulation.
+- A failure after output has started is an error, not permission to replay the request and duplicate output.
+- No client ping loop or fabricated turn metadata is required by this API.
 
-## Account stats
+These behaviors are verified with offline mocks. They are not a claim that every upstream WebSocket implementation, compression mode or long-running session has been integration-tested.
 
-```ts
-const stats = pool.stats();
-// [
-//   {
-//     name: "alice",              // config name, or "account-<index>"
-//     accountId: "acct_...",      // set after the first session load
-//     installationId: "device-id-for-alice",
-//     transport: "websocket",    // "http" | "websocket" (demoted ws shows "http")
-//     healthy: true,
-//     inflight: 1,
-//     cooldownRemainingMs: 0,
-//     consecutiveFailures: 0,
-//     codex: {                    // latest x-codex-* rate-window headers
-//       primaryUsedPercent: 12,
-//       secondaryUsedPercent: 4,
-//       primaryWindowMinutes: 300,
-//       planType: "plus",
-//     },
-//   },
-//   ...
-// ]
-```
+## Scheduling and limits
 
-## Options
+The scheduler uses weighted in-flight load and health observations. In-flight includes the lifetime of a streamed body, not just the time until its headers arrive. Cooling accounts do not receive new assignments; admission waits are cancellable and bounded.
+
+| Pool option | Default | Purpose |
+| --- | ---: | --- |
+| `maxInflightPerAccount` | 128 | Active response leases per account |
+| `maxQueuedRequests` | 1024 | Waiting requests |
+| `queueTimeoutMs` | 300000 | Maximum admission wait |
+| `maxRequestBodyBytes` | 8388608 | Maximum body inspected by the pool |
+| `healthRefreshMs` | disabled | `true` probes every 60 seconds; a positive integer sets the interval |
+
+These local limits do not grant upstream quota. `Retry-After` is honored; a rate window's length is not treated as its remaining reset time. Utilization observations have their own freshness and are not reset deadlines. A synthetic concurrent test is not a production-throughput benchmark.
+
+`pool.stats()` exposes account name/ID, installation ID, selected transport, health, in-flight count, cooldown and observed rate metadata. Do not expose those details to unauthorized callers.
+
+## Quota diagnostics
+
+`pool.stats()[i].quota` contains observed named quota `families` and optional account-level `credits`. Each primary/secondary window has its own `observedAt` and `stale` flag; timestamps and reset deadlines use epoch milliseconds. Credits retain the provider's bounded balance string rather than converting it into floating-point currency.
 
 ```ts
-type PoolAccountConfig = {
-	name?: string; // defaults to "account-<index>"
-	authFilePath: string; // required: this account's auth.json
-	proxy?: string; // http://, https://, socks5://, socks5h://
-	installationId?: string; // device id; generated, persisted into the auth file
-	preferNativeInstallationId?: boolean; // opt-in: claim the real CLI's
-	// ~/.codex/installation_id for THIS account (at most one account)
-	varyUserAgent?: boolean; // default false (uniform headless `unknown` UA).
-	// true: pin a stable, Linux-plausible UA terminal token per account
-	// (derived from its installationId — same value forever)
-	terminalToken?: string; // explicit token instead (overrides varyUserAgent);
-	// must be legitimately possible on headless Linux: unknown, xterm-256color,
-	// tmux-256color, screen(-256color), kitty, WezTerm/<build>, vscode/<ver>
-	transport?: "http" | "websocket"; // default "http"; ws falls back to HTTP
-	weight?: number; // default 1
-	fetch?: typeof fetch; // full escape hatch; overrides `proxy`
-	refreshFetch?: typeof fetch; // defaults to the data-path fetch (same proxy)
-	headers?: Record<string, string>;
-	instructions?: string;
-	baseURL?: string;
-	clientId?: string;
-	issuer?: string;
-	tokenUrl?: string;
-};
-
-type PoolConfig = {
-	accounts: PoolAccountConfig[];
-	codexVersion?: string; // pins the codex_cli_rs version in User-Agent
-	instructions?: string;
-	baseURL?: string;
-	openAIBaseURL?: string;
-	retryOnOtherAccount?: boolean; // default true: replay a rate-limited
-	// request on the next account after a human-scale (1–3s) pause;
-	// cross-account failover of a bare request is a trade-off the pool
-	// cannot make timing-invisible (a genuine CLI would back off on the
-	// SAME identity instead). Disable if plausibility beats availability.
-	rotateIdentity?: boolean; // default true: fresh derived device id per
-	// conversation (Codex's per-thread session-id lifecycle)
-	replay?: { ttlMs?: number; maxEntries?: number }; // pin TTL (30 min) and LRU size (10k)
-};
+const account = pool.stats().find((entry) => entry.name === "a");
+for (const family of account?.quota?.families ?? []) {
+    console.log(family.limitId, family.primary?.usedPercent, family.primary?.stale);
+}
 ```
+
+Observations come from response headers and consumed HTTP/WebSocket quota events. Opting into `healthRefreshMs` also polls each account's authenticated `/models` endpoint, refreshing any quota/rate headers it returns without reserving inference capacity. They are bounded to 32 families per account, marked stale after five minutes, and cleared when the observed credential owner changes. Partial updates do not refresh unrelated windows. Returned diagnostics are copies. Existing `codex` stats remain available.
+
+Additional meter families are diagnostics only: their names are not model aliases, entitlements or routing instructions, and they do not change scheduling or shorten restrictions.
+
+## Account-specific model catalogs
+
+```ts
+const catalog = await pool.getModelCatalog("a", { mode: "oauth-visible" });
+const cached = await pool.getModelCatalog("a", { cacheOnly: true });
+const refreshed = await pool.getModelCatalog("a", { refresh: true });
+```
+
+The name must identify exactly one configured account. Inspection does not select an inference owner, reserve an inference slot or imply that a later independently scheduled request will use this account. It never unions capabilities across accounts. See the core package for catalog fields, listing modes and context inspection.
+
+`cacheOnly` reads the **last observed** owner's cached metadata without loading credentials or making network requests. It does not verify external credential-file changes. Before any catalog is selected it returns `freshness: "missing"`; a normal call resolves current credentials. `refresh` and `cacheOnly` cannot be combined. Both account names and catalog ownership data must remain behind application authorization.
+
+## Serving diagnostics over HTTP
+
+After rebuilding, `bun run pool:serve -- --config /absolute/path/pool.json --diagnostics` exposes `/pool/stats`, `/pool/models` and `/pool/context` through the existing authenticated gateway. Alternatively enable `"diagnostics": true` in the private config (false by default). Model discovery and health polling remain disabled at startup unless `healthRefreshMs` is configured.
+
+HTTP DTOs omit internal account/installation IDs, paths and raw metadata. They still expose configured account names and operational information, and the server token grants access to all configured accounts. Context inspection uses cached metadata only; first request the targeted catalog when freshness is needed. See the [root examples](../../README.md#http-pool-diagnostics). These nonstandard inspection routes do not change `/v1` defaults or enable compaction.
+
+## Identity and persistence
+
+Existing installation identities are preserved. New installation IDs use UUIDv4; conversation identifiers have their own lifecycle. Do not rotate stored identities solely to satisfy a blanket UUID-version recommendation. Explicit identity/header options are compatibility settings, not detection-evasion guarantees.
+
+Auth-file replacement uses temporary files and rename with stale-snapshot checks. Coordination is process-local; it is not a cross-process or distributed compare-and-swap guarantee. Do not run multiple independent credential writers without external coordination.
 
 ## Lifecycle
 
 ```ts
-await pool.close(); // stop picking new work, release queued waiters
-await pool.destroy(); // close() + shut down proxy agents/connections
+await pool.close();   // reject new/queued work; current HTTP streams may finish
+await pool.destroy(); // shut down transports as well
 ```
 
-## Package notes
+Serve the pool on loopback or behind explicit authentication and TLS. The repository runner accepts `accessTokenEnv` for bearer authentication and requires `--allow-network` for a nonloopback bind. It defers model discovery until requested. See the root README for configuration.
 
-Proxy support uses [`undici`](https://github.com/nodejs/undici) `ProxyAgent` under the hood, lazily imported — accounts without a `proxy` don't pay for it. Every account should have its own proxy: sharing one proxy across accounts defeats the network isolation.
+## Verification boundary
 
-## More
-
-[Learn more in the openai-oauth README.](https://github.com/EvanZhouDev/openai-oauth#typescript-sdk)
+Tests cover mocked HTTP/WebSocket exchanges, cancellation, credential races and admission behavior. No live authentication/inference result, universal browser-runtime guarantee, automatic cross-account history transfer or undetectability guarantee is implied. PAT validation, remote compaction and richer model-template policy are separate features, not silently emulated here.

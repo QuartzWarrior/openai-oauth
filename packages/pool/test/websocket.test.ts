@@ -352,10 +352,14 @@ describe("websocket transport", () => {
 		const transport = makeTestTransport(clock)
 		const { text } = await roundTrip(clock, transport, { model: "gpt-5" })
 		expect(text).toContain("event: response.created\n")
-		expect(text).toContain('data: {"id":"resp_1"}')
+		expect(text).toContain(
+			'data: {"type":"response.created","response":{"id":"resp_1"}}',
+		)
 		expect(text).toContain("event: response.output_text.delta\n")
 		expect(text).toContain("event: response.completed\n")
-		expect(text).toContain('data: {"id":"resp_1","status":"completed"}')
+		expect(text).toContain(
+			'data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}',
+		)
 		expect(text.trimEnd().endsWith("data: [DONE]")).toBe(true)
 		await transport.close()
 	})
@@ -409,7 +413,6 @@ describe("websocket transport", () => {
 		expect(creates[1]).toMatchObject({
 			input: [{ role: "user", content: "other" }],
 			stream: true,
-			previous_response_id: expect.any(String),
 		})
 		expect(socket.framesOfType("input_text.delta")).toHaveLength(0)
 		await transport.close()
@@ -473,7 +476,9 @@ describe("websocket transport", () => {
 		const socket = FakeWebSocket.instances[0]
 		socket.open()
 		await clock.tick(0)
-		// Past the idle window with a completed (non-inflight) stream: teardown.
+		completeResponse(socket)
+		await clock.tick(0)
+		// An acknowledged warmup releases the exchange before the idle timeout.
 		await clock.tick(61_000)
 		expect(socket.closeCalls.length).toBeGreaterThanOrEqual(1)
 		await transport.close()
@@ -579,5 +584,530 @@ describe("websocket transport", () => {
 				transport.streamResponse({ model: "gpt-5" }, identity, ACCESS_TOKEN),
 			),
 		).rejects.toThrow(/closed/)
+	})
+})
+
+describe("websocket correctness regressions", () => {
+	it("uses trusted routing metadata rather than caller headers", () => {
+		const headers = buildWebsocketUpgradeHeaders(
+			{ ...identity, isFedRamp: true },
+			TEST_CODEX_VERSION,
+			{
+				"ChatGPT-Account-ID": "wrong",
+				"X-OpenAI-FedRAMP": "false",
+			},
+		)
+		expect(new Headers(headers).get("chatgpt-account-id")).toBe(
+			identity.accountId,
+		)
+		expect(new Headers(headers).get("x-openai-fedramp")).toBe("true")
+		expect(
+			new Headers(
+				buildWebsocketUpgradeHeaders(identity, TEST_CODEX_VERSION, {
+					"X-OpenAI-FedRAMP": "true",
+				}),
+			).has("x-openai-fedramp"),
+		).toBe(false)
+	})
+
+	it("preserves current turn/window options on a reused connection", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock()
+		const transport = makeTestTransport(clock)
+		const first = await roundTrip(
+			clock,
+			transport,
+			{ model: "gpt-5" },
+			{ ...identity, turnId: "turn-1", windowId: "window-1" },
+		)
+		await roundTrip(
+			clock,
+			transport,
+			{ model: "gpt-5" },
+			{
+				...identity,
+				turnId: "turn-2",
+				windowId: "window-2",
+				turnState: "sticky",
+			},
+		)
+		expect(
+			first.socket.framesOfType("response.create")[1]?.client_metadata,
+		).toMatchObject({
+			turn_id: "turn-2",
+			"x-codex-window-id": "window-2",
+			"x-codex-turn-state": "sticky",
+		})
+		await transport.close()
+	})
+
+	it("serializes whole exchanges and does not broadcast events across callers", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock()
+		const transport = makeTestTransport(clock)
+		const first = transport.streamResponse(
+			{ model: "gpt-5", input: [] },
+			identity,
+			ACCESS_TOKEN,
+		)
+		const second = transport.streamResponse(
+			{ model: "gpt-5", input: [] },
+			identity,
+			ACCESS_TOKEN,
+		)
+		await clock.tick(0)
+		const socket = FakeWebSocket.instances[0] as FakeWebSocket
+		socket.open()
+		await clock.tick(0)
+		expect(socket.framesOfType("response.create")).toHaveLength(1)
+		completeResponse(socket, "first")
+		await clock.tick(0)
+		expect(socket.framesOfType("response.create")).toHaveLength(2)
+		completeResponse(socket, "second")
+		expect(await readStreamText(await first)).toContain('"id":"first"')
+		const secondText = await readStreamText(await second)
+		expect(secondText).toContain('"id":"second"')
+		expect(secondText).not.toContain('"id":"first"')
+		await transport.close()
+	})
+
+	it("waits for prewarm completion before sending a turn", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock()
+		const transport = makeTestTransport(clock)
+		transport.prewarm(identity, ACCESS_TOKEN)
+		const pending = transport.streamResponse(
+			{ model: "gpt-5" },
+			identity,
+			ACCESS_TOKEN,
+		)
+		await clock.tick(0)
+		const socket = FakeWebSocket.instances[0] as FakeWebSocket
+		socket.open()
+		await clock.tick(0)
+		expect(socket.framesOfType("response.create")).toHaveLength(1)
+		completeResponse(socket, "warm")
+		await clock.tick(0)
+		expect(socket.framesOfType("response.create")).toHaveLength(2)
+		completeResponse(socket, "real")
+		const text = await readStreamText(await pending)
+		expect(text).not.toContain('"id":"warm"')
+		await transport.close()
+	})
+
+	it("rejects top-level errors before response.created immediately", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock()
+		const transport = makeTestTransport(clock)
+		const pending = transport.streamResponse(
+			{ model: "gpt-5" },
+			identity,
+			ACCESS_TOKEN,
+		)
+		const assertion = expect(pending).rejects.toThrow(
+			/reported an error \(overloaded\)/,
+		)
+		await clock.tick(0)
+		const socket = FakeWebSocket.instances[0] as FakeWebSocket
+		socket.open()
+		await clock.tick(0)
+		socket.serverSend({ type: "error", error: { code: "overloaded" } })
+		await assertion
+		await transport.close()
+	})
+
+	it("settles an active stream and queued request on close", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock()
+		const transport = makeTestTransport(clock)
+		const pending = transport.streamResponse(
+			{ model: "gpt-5" },
+			identity,
+			ACCESS_TOKEN,
+		)
+		await clock.tick(0)
+		const socket = FakeWebSocket.instances[0] as FakeWebSocket
+		socket.open()
+		await clock.tick(0)
+		socket.serverSend({ type: "response.created", response: { id: "active" } })
+		const stream = await pending
+		const reading = readStreamText(stream)
+		const readAssert = expect(reading).rejects.toThrow(/closed/)
+		const queued = transport.streamResponse(
+			{ model: "gpt-5" },
+			identity,
+			ACCESS_TOKEN,
+		)
+		const queuedAssert = expect(queued).rejects.toThrow(/closed/)
+		await transport.close()
+		await Promise.all([readAssert, queuedAssert])
+	})
+
+	it("supports abort before handshake and while waiting for socket ownership", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock()
+		const transport = makeTestTransport(clock)
+		const abort = new AbortController()
+		const first = transport.streamResponse(
+			{ model: "gpt-5" },
+			{ ...identity, signal: abort.signal },
+			ACCESS_TOKEN,
+		)
+		const assertion = expect(first).rejects.toThrow()
+		await clock.tick(0)
+		abort.abort()
+		await assertion
+		await transport.close()
+	})
+
+	it("rejects a slow consumer when the bounded websocket queue fills", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock()
+		const transport = makeTestTransport(clock, { maxBufferedBytes: 250 })
+		const pending = transport.streamResponse(
+			{ model: "gpt-5" },
+			identity,
+			ACCESS_TOKEN,
+		)
+		await clock.tick(0)
+		const socket = FakeWebSocket.instances[0] as FakeWebSocket
+		socket.open()
+		await clock.tick(0)
+		socket.serverSend({ type: "response.created", response: { id: "active" } })
+		const stream = await pending
+		for (let i = 0; i < 4; i++)
+			socket.serverSend({
+				type: "response.output_text.delta",
+				delta: "x".repeat(100),
+			})
+		await expect(readStreamText(stream)).rejects.toThrow(/buffer budget/)
+		await transport.close()
+	})
+
+	it("never reuses a predecessor when request semantics change", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock()
+		const transport = makeTestTransport(clock)
+		const { socket } = await roundTrip(clock, transport, {
+			model: "gpt-5",
+			instructions: "one",
+			input: [],
+		})
+		await roundTrip(clock, transport, {
+			model: "gpt-5",
+			instructions: "two",
+			input: [],
+		})
+		expect(socket.framesOfType("response.create")[1]).not.toHaveProperty(
+			"previous_response_id",
+		)
+		await transport.close()
+	})
+})
+
+describe("websocket connection setup cancellation", () => {
+	it.each([
+		"abort",
+		"close",
+	])("settles %s while an async factory is pending and closes its late socket", async (action) => {
+		const clock = createVirtualClock()
+		let resolveFactory: (socket: FakeWebSocket) => void = () => {}
+		let entered = false
+		const transport = createWebsocketTransport({
+			codexVersion: TEST_CODEX_VERSION,
+			now: clock.now,
+			timers: clock.timers,
+			webSocketFactory: async () => {
+				entered = true
+				return new Promise<FakeWebSocket>((resolve) => {
+					resolveFactory = resolve
+				})
+			},
+		})
+		const controller = new AbortController()
+		const pending = transport.streamResponse(
+			{ model: "gpt-5" },
+			{ ...identity, signal: controller.signal },
+			ACCESS_TOKEN,
+		)
+		const assertion = expect(pending).rejects.toThrow()
+		await clock.tick(0)
+		expect(entered).toBe(true)
+		if (action === "abort") controller.abort()
+		else await transport.close()
+		await assertion
+		const late = new FakeWebSocket("wss://late.example", {})
+		resolveFactory(late)
+		await clock.tick(0)
+		expect(late.closeCalls.length).toBeGreaterThan(0)
+		await transport.close()
+	})
+})
+
+describe("websocket prepared URLs", () => {
+	it("preserves encoded provider and request query parameters", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock()
+		const transport = makeTestTransport(clock)
+		const { socket } = await roundTrip(
+			clock,
+			transport,
+			{ model: "gpt-5" },
+			{
+				...identity,
+				url: "https://upstream.example/prefix/responses?api-version=v1&label=a%26b",
+			},
+		)
+		expect(socket.url).toBe(
+			"wss://upstream.example/prefix/responses?api-version=v1&label=a%26b",
+		)
+		await transport.close()
+	})
+	it("preserves configured query parameters without an explicit request URL", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock()
+		const transport = makeTestTransport(clock, {
+			baseURL: "https://upstream.example/prefix?api-version=v1",
+		})
+		const { socket } = await roundTrip(clock, transport, { model: "gpt-5" })
+		expect(socket.url).toBe(
+			"wss://upstream.example/prefix/responses?api-version=v1",
+		)
+		await transport.close()
+	})
+})
+
+describe("websocket composition metadata", () => {
+	it("preserves per-request Lite mode without leaking it to the next ordinary turn", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock(),
+			transport = makeTestTransport(clock)
+		const first = await roundTrip(
+			clock,
+			transport,
+			{ model: "gpt-5", input: [] },
+			{ ...identity, responsesLite: true },
+		)
+		expect(
+			first.socket.framesOfType("response.create")[0]?.client_metadata,
+		).toMatchObject({
+			ws_request_header_x_openai_internal_codex_responses_lite: "true",
+		})
+		const next = transport.streamResponse(
+			{ model: "gpt-5", input: [] },
+			identity,
+			ACCESS_TOKEN,
+		)
+		await clock.tick(0)
+		const frames = first.socket.framesOfType("response.create")
+		expect(frames[1]?.client_metadata).not.toHaveProperty(
+			"ws_request_header_x_openai_internal_codex_responses_lite",
+		)
+		completeResponse(first.socket, "next")
+		await clock.tick(0)
+		await readStreamText(await next)
+		await transport.close()
+	})
+	it("includes completed output items in incremental history when terminal output is empty", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock(),
+			transport = makeTestTransport(clock)
+		const input = [{ role: "user", content: "hello" }],
+			output = {
+				id: "o",
+				type: "message",
+				role: "assistant",
+				content: "answer",
+			}
+		const first = transport.streamResponse(
+			{ model: "m", input },
+			identity,
+			ACCESS_TOKEN,
+		)
+		await clock.tick(0)
+		const socket = FakeWebSocket.instances[0]
+		socket.open()
+		await clock.tick(0)
+		socket.serverSend({ type: "response.output_item.done", item: output })
+		socket.serverSend({
+			type: "response.completed",
+			response: { id: "r", output: [] },
+		})
+		await clock.tick(0)
+		await readStreamText(await first)
+		const next = transport.streamResponse(
+			{
+				model: "m",
+				input: [...input, output, { role: "user", content: "next" }],
+			},
+			identity,
+			ACCESS_TOKEN,
+		)
+		await clock.tick(0)
+		expect(socket.framesOfType("response.create")[1]).toMatchObject({
+			previous_response_id: "r",
+			input: [{ role: "user", content: "next" }],
+		})
+		completeResponse(socket, "next")
+		await clock.tick(0)
+		await readStreamText(await next)
+		await transport.close()
+	})
+	it("forwards quota events as protocol events and preserves typed quota errors", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock(),
+			transport = makeTestTransport(clock)
+		const pending = transport.streamResponse(
+			{ model: "m" },
+			identity,
+			ACCESS_TOKEN,
+		)
+		await clock.tick(0)
+		const socket = FakeWebSocket.instances[0]
+		socket.open()
+		await clock.tick(0)
+		socket.serverSend({
+			type: "codex.rate_limits",
+			rate_limits: { primary: { used_percent: 100, reset_at: 200 } },
+		})
+		await clock.tick(0)
+		const stream = await pending
+		const reader = stream.getReader()
+		expect(new TextDecoder().decode((await reader.read()).value)).toContain(
+			"codex.rate_limits",
+		)
+		socket.serverSend({
+			type: "error",
+			status: 429,
+			error: { code: "rate_limit_exceeded", resets_at: 200 },
+		})
+		await clock.tick(0)
+		await expect(reader.read()).rejects.toMatchObject({
+			category: "throttled",
+			status: 429,
+		})
+		await transport.close()
+	})
+	it.each([
+		{
+			name: "string Retry-After and mixed-case identifiers",
+			headers: {
+				"Retry-After": "3600",
+				"X-Codex-Active-Limit": "family",
+				"X-Request-Id": "request-1",
+				authorization: "Bearer must-not-be-retained",
+			},
+			retryAt: 3_600_000,
+			limitId: "family",
+			requestId: "request-1",
+		},
+		{
+			name: "numeric Retry-After",
+			headers: { "retry-after": 3600 },
+			retryAt: 3_600_000,
+		},
+		{
+			name: "HTTP-date Retry-After",
+			headers: { "retry-after": "Thu, 01 Jan 1970 01:00:00 GMT" },
+			retryAt: 3_600_000,
+		},
+		{
+			name: "longer body reset",
+			headers: { "retry-after": "3600" },
+			resetsAt: 7200,
+			retryAt: 7_200_000,
+		},
+		{
+			name: "longer header reset",
+			headers: { "retry-after": "7200" },
+			resetsAt: 3600,
+			retryAt: 7_200_000,
+		},
+		{
+			name: "malformed values are ignored independently",
+			headers: {
+				"retry-after": ["3600"],
+				"x-codex-active-limit": { value: "family" },
+				"x-request-id": "request-2",
+			},
+			retryAt: undefined,
+			requestId: "request-2",
+		},
+		{
+			name: "oversized and control-character values are ignored",
+			headers: {
+				"retry-after": "1".repeat(257),
+				"x-codex-active-limit": "family\r\ninjected: value",
+				"x-request-id": null,
+			},
+			retryAt: undefined,
+		},
+		{
+			name: "a non-object header collection is ignored",
+			headers: ["retry-after", "3600"],
+			retryAt: undefined,
+		},
+	])("preserves wrapped error policy: $name", async (testCase) => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock()
+		const transport = makeTestTransport(clock)
+		try {
+			const pending = transport.streamResponse(
+				{ model: "m" },
+				identity,
+				ACCESS_TOKEN,
+			)
+			const rejection = expect(pending).rejects.toMatchObject({
+				category: "throttled",
+				status: 429,
+				retryAt: testCase.retryAt,
+				limitId: testCase.limitId,
+				requestId: testCase.requestId,
+			})
+			await clock.tick(0)
+			const socket = FakeWebSocket.instances[0]
+			socket.open()
+			await clock.tick(0)
+			socket.serverSend({
+				type: "error",
+				status: 429,
+				error: {
+					type: "rate_limit_exceeded",
+					resets_at: testCase.resetsAt,
+				},
+				headers: testCase.headers,
+			})
+			await clock.tick(0)
+			await rejection
+		} finally {
+			await transport.close()
+		}
+	})
+	it("progress resets idle timeout and downstream queued data is not upstream idleness", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock(),
+			transport = makeTestTransport(clock, { streamIdleTimeoutMs: 100 })
+		const pending = transport.streamResponse(
+			{ model: "m" },
+			identity,
+			ACCESS_TOKEN,
+		)
+		await clock.tick(0)
+		const socket = FakeWebSocket.instances[0]
+		socket.open()
+		await clock.tick(0)
+		socket.serverSend({ type: "response.created", response: { id: "r" } })
+		await clock.tick(0)
+		const reader = (await pending).getReader()
+		await reader.read()
+		await clock.tick(80)
+		socket.serverSend({ type: "response.output_text.delta", delta: "x" })
+		await clock.tick(0)
+		await clock.tick(150)
+		expect(socket.closeCalls).toHaveLength(0)
+		await reader.read()
+		await clock.tick(101)
+		await expect(reader.read()).rejects.toThrow(/idle timeout/)
+		await transport.close()
 	})
 })

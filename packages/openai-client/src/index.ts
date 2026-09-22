@@ -28,6 +28,9 @@ const toTransport = (input: OpenAIClientInput): OpenAIOAuthTransport => {
 	if (isTransport(input)) {
 		return input
 	}
+	if (input.transport) {
+		return input.transport
+	}
 
 	return createOpenAIOAuthTransport({
 		auth: () => input.getSession(),

@@ -310,7 +310,9 @@ describe("loadAuthTokens", () => {
 
 			expect(result.accessToken).toBe("new-access")
 			expect(result.accountId).toBe("acct-2")
-			expect(result.isFedRamp).toBe(true)
+			// Routing comes from the returned credentials, not a sticky flag on
+			// the expired token that was replaced.
+			expect(result.isFedRamp).toBe(false)
 			expect(result.refreshToken).toBe("new-refresh")
 
 			const updated = JSON.parse(await fs.readFile(authPath, "utf-8"))

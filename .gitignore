@@ -6,3 +6,5 @@ apps/demo/next-env.d.ts
 .turbo
 *.tsbuildinfo
 .DS_Store
+# Added by code-review-graph
+.code-review-graph/

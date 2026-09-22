@@ -150,6 +150,48 @@ describe("openai oauth cli", () => {
 		expect(loginOptions).not.toHaveProperty("port")
 	})
 
+	test("parses proxy and pool config for login only", () => {
+		const parsed = parseCliArgs([
+			"login",
+			"--proxy",
+			"http://proxy.test:8080",
+			"--pool-config",
+			"/tmp/pool.json",
+			"--auth-file",
+			"/tmp/account.json",
+			"--no-open",
+		])
+		expect(toLoginOptions(parsed)).toMatchObject({
+			proxy: "http://proxy.test:8080",
+			poolConfigPath: "/tmp/pool.json",
+			authFilePath: "/tmp/account.json",
+			openBrowser: false,
+		})
+		expect(toHelpMessage()).toContain("--proxy <url>")
+		expect(toHelpMessage()).toContain("--pool-config <path>")
+		expect(() =>
+			parseCliArgs(["serve", "--proxy", "http://proxy.test:8080"]),
+		).toThrow("supported only by login")
+		expect(() =>
+			parseCliArgs(["login", "--pool-config", "/tmp/pool.json"]),
+		).toThrow("requires login --proxy")
+	})
+
+	test("normalizes quoted tilde auth paths before overwrite checking", () => {
+		const login = toLoginOptions(
+			parseCliArgs([
+				"login",
+				"--auth-file",
+				"~/.codex/accounts/example.json",
+				"--proxy",
+				"http://proxy.test:8080",
+			]),
+		)
+		expect(login.authFilePath).toBe(
+			path.join(os.homedir(), ".codex/accounts/example.json"),
+		)
+	})
+
 	test("parses detached serve flags", () => {
 		expect(parseCliArgs(["--detach"])).toMatchObject({
 			command: "serve",
@@ -319,18 +361,24 @@ describe("openai oauth cli", () => {
 		}
 
 		const messages: string[] = []
-		await expect(
-			runOpenAIOAuthLogin({
-				authFilePath: "/tmp/openai-oauth-test-auth.json",
-				openBrowser: false,
-				timeoutMs: 1,
-				onMessage: (message) => messages.push(message),
-			}),
-		).rejects.toThrow("timed out")
-
-		expect(decodeURIComponent(messages.join("\n"))).toContain(
-			"http://localhost:1455/auth/callback",
-		)
+		const controller = new AbortController()
+		const pending = runOpenAIOAuthLogin({
+			authFilePath: "/tmp/openai-oauth-test-auth.json",
+			openBrowser: false,
+			timeoutMs: 5000,
+			signal: controller.signal,
+			onMessage: (message) => messages.push(message),
+		})
+		const rejected = expect(pending).rejects.toThrow("cancelled")
+		try {
+			await waitForLoginUrl(messages)
+			expect(decodeURIComponent(messages.join("\n"))).toContain(
+				"http://localhost:1455/auth/callback",
+			)
+		} finally {
+			controller.abort()
+			await rejected
+		}
 	})
 
 	test("saves credentials after a successful local callback", async () => {
@@ -423,6 +471,146 @@ describe("openai oauth cli", () => {
 
 		await expect(loginPromise).rejects.toThrow("login cancelled")
 		expect(await canBindLoopback(1455)).toBe(true)
+	})
+
+	test.each([
+		"abort",
+		"timeout",
+	])("stops a pending token exchange on %s without saving credentials", async (mode) => {
+		if (!(await canBindLoopback(1455))) return
+		const root = await fs.mkdtemp(
+			path.join(os.tmpdir(), "openai-oauth-login-cancel-"),
+		)
+		const authFilePath = path.join(root, "auth.json")
+		const messages: string[] = []
+		const controller = new AbortController()
+		let tokenSignal: AbortSignal | null | undefined
+		const tokenFetch = vi.fn(async (_url, init?: RequestInit) => {
+			tokenSignal = init?.signal
+			return await new Promise<Response>(() => undefined)
+		})
+		try {
+			const pending = runOpenAIOAuthLogin({
+				authFilePath,
+				openBrowser: false,
+				timeoutMs: mode === "timeout" ? 500 : 5000,
+				fetch: tokenFetch,
+				signal: controller.signal,
+				onMessage: (message) => messages.push(message),
+			})
+			const rejected = expect(pending).rejects.toThrow(
+				mode === "timeout" ? "timed out" : "cancelled",
+			)
+			const url = await waitForLoginUrl(messages)
+			await (
+				await fetch(
+					`${url.searchParams.get("redirect_uri")}?code=test&state=${url.searchParams.get("state")}`,
+				)
+			).text()
+			await vi.waitFor(() => expect(tokenFetch).toHaveBeenCalledOnce())
+			if (mode === "abort") controller.abort()
+			await rejected
+			expect(tokenSignal?.aborted).toBe(true)
+			await expect(fs.stat(authFilePath)).rejects.toMatchObject({
+				code: "ENOENT",
+			})
+			expect(await canBindLoopback(1455)).toBe(true)
+		} finally {
+			controller.abort()
+			await fs.rm(root, { recursive: true, force: true })
+		}
+	})
+
+	test.each([
+		"before-rename",
+		"after-rename",
+	])("login reports the credential commit boundary on %s cancellation", async (boundary) => {
+		if (!(await canBindLoopback(1455))) return
+		const root = await fs.mkdtemp(
+			path.join(os.tmpdir(), "openai-oauth-login-save-"),
+		)
+		const authFilePath = path.join(root, "auth.json")
+		const controller = new AbortController()
+		const messages: string[] = []
+		const originalOpen = fs.open.bind(fs)
+		const originalRename = fs.rename.bind(fs)
+		const open = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+			const handle = await originalOpen(...args)
+			if (
+				boundary === "before-rename" &&
+				args[1] === "wx" &&
+				path.dirname(String(args[0])) === root
+			) {
+				const write = handle.writeFile.bind(handle)
+				vi.spyOn(handle, "writeFile").mockImplementation(
+					async (...writeArgs) => {
+						await write(...writeArgs)
+						controller.abort()
+					},
+				)
+			}
+			return handle
+		})
+		const rename = vi
+			.spyOn(fs, "rename")
+			.mockImplementation(async (...args) => {
+				await originalRename(...args)
+				if (boundary === "after-rename" && String(args[1]) === authFilePath)
+					controller.abort()
+			})
+		try {
+			const pending = runOpenAIOAuthLogin({
+				authFilePath,
+				openBrowser: false,
+				timeoutMs: 5000,
+				signal: controller.signal,
+				onMessage: (message) => messages.push(message),
+				fetch: async () =>
+					Response.json({
+						access_token: "synthetic-access",
+						id_token: createJwt({
+							"https://api.openai.com/auth": {
+								chatgpt_account_id: "synthetic-account",
+							},
+						}),
+					}),
+			})
+			const result = pending.then(
+				(value) => ({ saved: value }),
+				(error) => ({ error }),
+			)
+			const url = await waitForLoginUrl(messages)
+			await (
+				await fetch(
+					`${url.searchParams.get("redirect_uri")}?code=test&state=${url.searchParams.get("state")}`,
+				)
+			).text()
+			const outcome = await result
+			if (boundary === "before-rename") {
+				expect(outcome).toHaveProperty("error")
+				await expect(fs.stat(authFilePath)).rejects.toMatchObject({
+					code: "ENOENT",
+				})
+				expect(
+					messages.some((message) => message.startsWith("Credentials saved")),
+				).toBe(false)
+			} else {
+				expect(outcome).toHaveProperty("saved.path", authFilePath)
+				expect(
+					JSON.parse(await fs.readFile(authFilePath, "utf8")).tokens
+						.access_token,
+				).toBe("synthetic-access")
+				expect(messages).toContain(`Credentials saved to ${authFilePath}`)
+			}
+			expect(await fs.readdir(root)).toEqual(
+				boundary === "after-rename" ? ["auth.json"] : [],
+			)
+		} finally {
+			controller.abort()
+			open.mockRestore()
+			rename.mockRestore()
+			await fs.rm(root, { recursive: true, force: true })
+		}
 	})
 
 	test("errors clearly when the default callback port is busy", async () => {

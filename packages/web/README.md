@@ -60,7 +60,9 @@ const session = await getSession({ sessionStore });
 const headers = await openaiAuthHeaders({ sessionStore });
 ```
 
-`getSession()` reads the browser session store and refreshes with the stored refresh token when needed.
+`getSession()` reads the browser session store and refreshes with the stored refresh token when needed. `refreshStoredSession()` explicitly refreshes the current stored credential with the same safeguards; `refreshSession()` is the lower-level token exchange and does not persist a session.
+
+Stored refreshes are coalesced within one JavaScript realm and store namespace. Local generation checks fence logout/account replacement, and the built-in IndexedDB store uses an atomic encrypted-snapshot comparison before committing a refreshed credential. Its encryption-key initialization is also atomic. These checks do not provide cross-tab network singleflight or broadcast UI synchronization. Custom three-method `SessionStore` implementations must coordinate their own external writers; a read/check/write is not cross-tab compare-and-set. Pass `signal` to cancel a session load or callback; cancelling one refresh waiter does not cancel other subscribers.
 
 `openaiAuthHeaders()` returns a plain object of request headers for your own app route:
 
@@ -142,6 +144,12 @@ await logout();
 
 `completeLogin()` returns the signed-in session when the current URL contains an OAuth callback, and `null` when there is no callback to complete.
 
+Callback consumers sharing a store/pending-login identity in one JavaScript realm share one code exchange. Cancelling one subscriber does not cancel the others; cancelling the last subscriber prevents late persistence. `callbackTimeoutMs` bounds the shared callback operation (default five minutes). At most one settled callback is retained per store for one minute to avoid immediate one-use-code retries. Pending storage reads are caller-cancellable without abandoning the store's internal serialization order.
+
+Maintenance refreshes do not invalidate a pending explicit login. They may advance that login's verified credential snapshot; logout, a newer login, or an explicit store replacement still wins. When using a custom store, pass the same `sessionStore` to `startLogin`, `completeLogin`, and session helpers. This is in-realm arbitration, not cross-tab network single-flight; custom external writers still require their own atomic coordination.
+
+Maintenance refreshes have an operation-owned `refreshTimeoutMs` deadline (default 30 seconds), covering token exchange, body reads and pre-commit waits. A timeout clears the shared pending operation so a later call can retry, and late results cannot replace the session. Cancelling one subscriber does not cancel another subscriber's refresh.
+
 Useful browser options:
 
 ```ts
@@ -152,6 +160,7 @@ type BrowserSessionOptions = {
 	tokenUrl?: string;
 	fetch?: typeof fetch;
 	refresh?: boolean;
+	refreshTimeoutMs?: number;
 	now?: () => Date;
 };
 ```

@@ -274,7 +274,7 @@ describe("createCodexOAuthFetch", () => {
 		])
 	})
 
-	test("never forwards x-openai-fedramp (codex-rs emits no such header)", async () => {
+	test("reconstructs FedRAMP routing from the trusted session", async () => {
 		const fetch = createMockFetch()
 		const oauthFetch = createCodexOAuthFetch({
 			auth: { ...session, isFedRamp: true },
@@ -291,10 +291,7 @@ describe("createCodexOAuthFetch", () => {
 		})
 
 		const [, init] = upstreamCalls(fetch)[0] ?? []
-		// The marker is stripped (never echoed from caller headers either):
-		// codex-rs has no FedRAMP header on the wire, so a "true" stamp would be
-		// a positive non-codex tell.
-		expect(new Headers(init?.headers).get("x-openai-fedramp")).toBeNull()
+		expect(new Headers(init?.headers).get("x-openai-fedramp")).toBe("true")
 	})
 
 	test("preserves absolute codex urls without duplicating the upstream path", async () => {

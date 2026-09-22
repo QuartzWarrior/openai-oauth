@@ -195,6 +195,24 @@ export const runOpenAIOAuthLogin = async (
 	const listenHost = options.host
 	const callbackPort = DEFAULT_LOGIN_PORT
 	const timeoutMs = options.timeoutMs ?? DEFAULT_LOGIN_TIMEOUT_MS
+	if (
+		!Number.isSafeInteger(timeoutMs) ||
+		timeoutMs <= 0 ||
+		timeoutMs > 2_147_483_647
+	) {
+		throw new Error("Login timeout must be a positive integer in milliseconds.")
+	}
+	const controller = new AbortController()
+	const cancel = () => controller.abort(createLoginCancelledError())
+	options.signal?.addEventListener("abort", cancel, { once: true })
+	const timeoutHandle = setTimeout(
+		() => {
+			controller.abort(new Error("OpenAI OAuth login timed out."))
+		},
+		Math.min(timeoutMs, 2_147_483_647),
+	)
+	timeoutHandle.unref()
+	const signal = controller.signal
 	const onMessage = options.onMessage ?? console.log
 
 	let expectedState = ""
@@ -212,9 +230,12 @@ export const runOpenAIOAuthLogin = async (
 		rejectAbort = reject
 	})
 	const abortLogin = () => {
-		rejectAbort?.(createLoginCancelledError())
+		rejectAbort?.(signal.reason ?? createLoginCancelledError())
 	}
-	options.signal?.addEventListener("abort", abortLogin, { once: true })
+	signal.addEventListener("abort", abortLogin, { once: true })
+	// Startup can fail before Promise.race attaches its rejection handlers.
+	void abortPromise.catch(() => undefined)
+	void callbackPromise.catch(() => undefined)
 
 	const handleCallbackRequest = (
 		req: IncomingMessage,
@@ -266,32 +287,32 @@ export const runOpenAIOAuthLogin = async (
 		settleCallback?.({ code })
 	}
 
-	if (await isCallbackHostReachable(redirectHost, callbackPort)) {
-		throw new Error(toCallbackPortInUseMessage(redirectHost, callbackPort))
-	}
-
 	try {
-		servers = await listenOnCallbackPort(
-			handleCallbackRequest,
-			callbackPort,
-			listenHost,
-		)
-		const address = servers[0]?.address() as AddressInfo | null
-		if (address?.port !== callbackPort) {
-			throw new Error("OpenAI OAuth login callback port could not be resolved.")
-		}
-	} catch (error) {
-		if (isAddressInUseError(error)) {
+		if (await isCallbackHostReachable(redirectHost, callbackPort)) {
 			throw new Error(toCallbackPortInUseMessage(redirectHost, callbackPort))
 		}
-		throw error
-	}
 
-	try {
-		redirectUri = `http://${redirectHost}:${callbackPort}/auth/callback`
-		if (options.signal?.aborted) {
-			throw createLoginCancelledError()
+		try {
+			servers = await listenOnCallbackPort(
+				handleCallbackRequest,
+				callbackPort,
+				listenHost,
+			)
+			const address = servers[0]?.address() as AddressInfo | null
+			if (address?.port !== callbackPort) {
+				throw new Error(
+					"OpenAI OAuth login callback port could not be resolved.",
+				)
+			}
+		} catch (error) {
+			if (isAddressInUseError(error)) {
+				throw new Error(toCallbackPortInUseMessage(redirectHost, callbackPort))
+			}
+			throw error
 		}
+
+		redirectUri = `http://${redirectHost}:${callbackPort}/auth/callback`
+		signal.throwIfAborted()
 		const request = await createOpenAIOAuthRequest({
 			redirectUri,
 			clientId: options.clientId,
@@ -303,34 +324,33 @@ export const runOpenAIOAuthLogin = async (
 			openUrl(request.authorizationUrl)
 		}
 
-		const timeout = new Promise<never>((_, reject) => {
-			setTimeout(() => {
-				reject(new Error("OpenAI OAuth login timed out."))
-			}, timeoutMs).unref()
-		})
-		const callback = await Promise.race([
-			callbackPromise,
-			timeout,
+		const callback = await Promise.race([callbackPromise, abortPromise])
+		signal.throwIfAborted()
+		const token = await Promise.race([
+			exchangeOpenAIOAuthCode({
+				code: callback.code,
+				codeVerifier: request.codeVerifier,
+				redirectUri,
+				clientId: options.clientId,
+				tokenUrl: options.tokenUrl,
+				fetch: options.fetch,
+				signal,
+			}),
 			abortPromise,
 		])
-		const token = await exchangeOpenAIOAuthCode({
-			code: callback.code,
-			codeVerifier: request.codeVerifier,
-			redirectUri,
-			clientId: options.clientId,
-			tokenUrl: options.tokenUrl,
-			fetch: options.fetch,
-			signal: options.signal,
-		})
+		signal.throwIfAborted()
 		const saved = await saveAuthTokens({
 			token,
 			authFilePath: options.authFilePath,
+			signal,
 		})
 
 		onMessage(`Credentials saved to ${saved.path}`)
 		return saved
 	} finally {
-		options.signal?.removeEventListener("abort", abortLogin)
+		clearTimeout(timeoutHandle)
+		options.signal?.removeEventListener("abort", cancel)
+		signal.removeEventListener("abort", abortLogin)
 		await closeServers(servers)
 	}
 }

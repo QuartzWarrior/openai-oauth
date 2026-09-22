@@ -49,6 +49,29 @@ describe("Codex model catalog", () => {
 		])
 	})
 
+	test("keeps nested fetch implementations from sharing an in-flight lookup", async () => {
+		resetCodexClientVersionCache()
+		const innerFetch = vi.fn(async () => Response.json({ version: "0.144.1" }))
+		const outerFetch = vi.fn(async () => {
+			const version = await resolveCodexClientVersion({
+				fetchImpl: innerFetch,
+			})
+			return Response.json({ version })
+		})
+		const timeout = new Promise<"timed out">((resolve) => {
+			setTimeout(() => resolve("timed out"), 100)
+		})
+
+		await expect(
+			Promise.race([
+				resolveCodexClientVersion({ fetchImpl: outerFetch }),
+				timeout,
+			]),
+		).resolves.toBe("0.144.1")
+		expect(innerFetch).toHaveBeenCalledTimes(1)
+		expect(outerFetch).toHaveBeenCalledTimes(1)
+	})
+
 	test("parses model metadata using the resolved client version", async () => {
 		resetCodexClientVersionCache()
 		const request = vi.fn(async () =>
@@ -74,6 +97,8 @@ describe("Codex model catalog", () => {
 				useResponsesLite: true,
 			},
 		])
-		expect(request).toHaveBeenCalledWith("/models?client_version=0.144.1")
+		expect(request).toHaveBeenCalledWith("/models?client_version=0.144.1", {
+			signal: expect.any(AbortSignal),
+		})
 	})
 })

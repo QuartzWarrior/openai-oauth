@@ -1,7 +1,9 @@
 import type { FetchFunction } from "@openai-oauth/core"
 
 type UndiciProxyAgent = {
-	close(): Promise<void>
+	destroy?(): Promise<void>
+	close?(): Promise<void>
+	dispatch?: (...args: unknown[]) => unknown
 }
 
 type UndiciModule = {
@@ -12,17 +14,13 @@ type UndiciModule = {
 	ProxyAgent: new (options: string | { uri: string }) => UndiciProxyAgent
 }
 
-const SUPPORTED_PROXY_PROTOCOLS = new Set([
-	"http:",
-	"https:",
-	"socks5:",
-	"socks5h:",
-])
+const SUPPORTED_PROXY_PROTOCOLS = new Set(["http:", "https:"])
 
 export type AccountRuntime = {
 	fetch: FetchFunction
 	fetchDispatcherUsed: boolean
 	close(): Promise<void>
+	destroy(): Promise<void>
 }
 
 let undiciModulePromise: Promise<UndiciModule | undefined> | undefined
@@ -39,20 +37,18 @@ export const validateProxyUrl = (proxy: string): void => {
 	try {
 		parsed = new URL(proxy)
 	} catch {
-		throw new Error(
-			`Invalid proxy URL "${proxy}". Expected something like "http://user:pass@host:8000" or "socks5h://host:1080".`,
-		)
+		throw new Error("Invalid proxy URL. Expected an HTTP(S) proxy URL.")
 	}
 	if (!SUPPORTED_PROXY_PROTOCOLS.has(parsed.protocol)) {
 		throw new Error(
-			`Unsupported proxy protocol "${parsed.protocol}". Supported: http, https, socks5, socks5h.`,
+			`Unsupported proxy protocol "${parsed.protocol}". Supported: http, https.`,
 		)
 	}
 }
 
 /**
  * Builds a fetch implementation that routes through the given static proxy via
- * undici (Node.js >= 20). Each proxy URL gets its own ProxyAgent, which keeps
+ * undici (Node.js >= 20.18.1). Each proxy URL gets its own ProxyAgent, which keeps
  * connection pools, DNS, and credentials fully isolated per account.
  *
  * Throws in non-Node runtimes: when no undici-compatible environment is
@@ -67,13 +63,29 @@ export const createProxyRuntime = async (
 	const undici = await loadUndici()
 	if (!undici) {
 		throw new Error(
-			"Proxy support requires Node.js >= 20. Account proxies are not available in browser/edge runtimes; omit `proxy` (or pass an explicit `fetch`) for those environments.",
+			"Proxy support requires Node.js >= 20.18.1. Account proxies are not available in browser/edge runtimes; omit `proxy` (or pass an explicit `fetch`) for those environments.",
 		)
 	}
 
+	// Some runtimes provide an undici stub without dispatcher support.
 	const agent = new undici.ProxyAgent({ uri: proxy })
+	if (typeof agent.dispatch !== "function") {
+		await agent.close?.()
+		throw new Error(
+			"This runtime cannot honor the configured proxy dispatcher. Use Node.js with undici or an explicit proxy-aware fetch.",
+		)
+	}
 	const proxiedFetch = ((input: RequestInfo | URL, init?: RequestInit) =>
-		undici.fetch(String(input instanceof Request ? input.url : input), {
+		undici.fetch(input instanceof Request ? input.url : String(input), {
+			...(input instanceof Request
+				? {
+						method: input.method,
+						headers: input.headers,
+						body: input.body,
+						signal: input.signal,
+						duplex: "half",
+					}
+				: {}),
 			...(init ?? {}),
 			dispatcher: agent,
 		})) as FetchFunction
@@ -81,7 +93,15 @@ export const createProxyRuntime = async (
 	return {
 		fetch: proxiedFetch,
 		fetchDispatcherUsed: true,
-		close: () => agent.close(),
+		destroy: async () => {
+			if (agent.destroy) await agent.destroy()
+			else await agent.close?.()
+		},
+		close: async () => {
+			// undefined under Bun's stub; calling it throws "agent.close is not a
+			// function". Only real undici exposes it.
+			await agent.close?.()
+		},
 	}
 }
 
@@ -92,4 +112,6 @@ export const createPlainRuntime = (fetch?: FetchFunction): AccountRuntime => ({
 			globalThis.fetch(input, init)) as FetchFunction),
 	fetchDispatcherUsed: false,
 	close: () => Promise.resolve(),
+	// Custom/global fetch resources are not owned by this adapter.
+	destroy: () => Promise.resolve(),
 })

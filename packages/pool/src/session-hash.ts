@@ -28,10 +28,9 @@ const itemIdentity = (item: unknown): unknown => {
 }
 
 /**
- * Fingerprints the stable identity of a `/responses` request: model,
- * instructions, and the system/input messages that define the conversation up
- * to this point. Used to pin identical (re)requests to the account that
- * served the original, preserving server-replay chains.
+ * Describes identical-request affinity. This changes as input changes and must
+ * never be used as a continuation ownership index. The pool stores a digest of
+ * this value and routes continuation IDs separately.
  */
 export const computeSessionHash = (
 	parsedBody: JsonRecord,
@@ -75,6 +74,14 @@ export class ReplayMap<TValue> {
 		this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS
 		this.maxEntries = options.maxEntries ?? DEFAULT_MAX_ENTRIES
 		this.now = options.now ?? (() => Date.now())
+		if (
+			!Number.isFinite(this.ttlMs) ||
+			this.ttlMs <= 0 ||
+			!Number.isSafeInteger(this.maxEntries) ||
+			this.maxEntries <= 0
+		) {
+			throw new Error("Replay maps require a positive TTL and entry limit.")
+		}
 	}
 
 	get(hash: string): TValue | undefined {

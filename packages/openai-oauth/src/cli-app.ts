@@ -26,7 +26,7 @@ import {
 	stopCliRuntime,
 } from "./cli-runtime.js"
 import { runCliWorker } from "./cli-worker.js"
-import { runOpenAIOAuthLogin } from "./login.js"
+import { resolveLoginAuthFilePath, runLoginCommand } from "./login-command.js"
 import { DEFAULT_PORT } from "./shared.js"
 import { checkForOpenAIOAuthUpdates } from "./update-check.js"
 import { packageVersion } from "./version.js"
@@ -45,6 +45,8 @@ export type CliArgs = {
 	authFilePath?: string
 	openBrowser?: boolean
 	loginTimeoutMs?: number
+	proxy?: string
+	poolConfigPath?: string
 	detach?: boolean
 	follow?: boolean
 	internalDetachedChild?: boolean
@@ -95,6 +97,8 @@ const helpLines = [
 	"  --oauth-file <path>        Path to the local auth.json file (alias: --auth-file).",
 	"  --no-open                  Print the login URL without opening a browser.",
 	"  --login-timeout-ms <ms>    Login timeout. Default: 300000",
+	"  --proxy <url>              Login only: HTTP(S) proxy for token exchange; saved to the pool config.",
+	"  --pool-config <path>       Login only, with --proxy. Default: $XDG_CONFIG_HOME/openai-oauth/pool.json or ~/.config/openai-oauth/pool.json.",
 	"",
 	"Flags",
 	"  -d, --detach               Run in the background",
@@ -156,6 +160,17 @@ const createCliParser = (argv: string[]) =>
 			type: "number",
 			describe: "Login timeout in milliseconds. Default: 300000",
 		})
+		.option("proxy", {
+			type: "string",
+			requiresArg: true,
+			describe:
+				"Login only: HTTP(S) proxy for token exchange and pool configuration.",
+		})
+		.option("pool-config", {
+			type: "string",
+			requiresArg: true,
+			describe: "Pool configuration to update after a proxied login.",
+		})
 		.option("detach", {
 			alias: "d",
 			type: "boolean",
@@ -204,6 +219,15 @@ export const parseCliArgs = (argv: string[]): CliArgs => {
 	const parsed = createCliParser(
 		command === "serve" && first !== "serve" ? argv : argv.slice(1),
 	).parseSync()
+	if (
+		(parsed.proxy !== undefined || parsed.poolConfig !== undefined) &&
+		command !== "login"
+	) {
+		throw new Error("--proxy and --pool-config are supported only by login.")
+	}
+	if (parsed.poolConfig !== undefined && parsed.proxy === undefined) {
+		throw new Error("--pool-config requires login --proxy.")
+	}
 
 	return {
 		command,
@@ -217,6 +241,8 @@ export const parseCliArgs = (argv: string[]): CliArgs => {
 		authFilePath: parsed.oauthFile,
 		openBrowser: parsed.open,
 		loginTimeoutMs: parsed.loginTimeoutMs,
+		proxy: parsed.proxy,
+		poolConfigPath: parsed.poolConfig,
 		detach: parsed.detach,
 		follow: parsed.follow,
 		internalDetachedChild: parsed.internalDetachedChild,
@@ -237,9 +263,11 @@ export const toServerOptions = (args: CliArgs) => ({
 export const toLoginOptions = (args: CliArgs) => ({
 	clientId: args.clientId,
 	tokenUrl: args.tokenUrl,
-	authFilePath: args.authFilePath,
+	authFilePath: resolveLoginAuthFilePath(args.authFilePath),
 	openBrowser: args.openBrowser,
 	timeoutMs: args.loginTimeoutMs,
+	proxy: args.proxy,
+	poolConfigPath: args.poolConfigPath,
 })
 
 const findExistingAuthFile = async (
@@ -376,7 +404,7 @@ const runLoginWithCancellation = async (
 ): Promise<boolean> => {
 	const cancellation = createLoginCancellation()
 	try {
-		await runOpenAIOAuthLogin({
+		await runLoginCommand({
 			...options,
 			signal: cancellation.signal,
 		})
@@ -654,8 +682,8 @@ export const runCli = async (argv: string[] = hideBin(process.argv)) => {
 	}
 
 	if (args.command === "login") {
-		const updateCheck = runUpdateCheck()
-		await updateCheck
+		// Avoid an unrelated direct registry lookup during explicitly proxied login.
+		if (args.proxy === undefined) await runUpdateCheck()
 		const loginOptions = toLoginOptions(args)
 		const existingAuthFile = await findExistingCodexAuthFile(
 			loginOptions.authFilePath,

@@ -1,5 +1,7 @@
 import type { Server as HttpServer } from "node:http"
+import type { OpenAIOAuth } from "@openai-oauth/core"
 import type { LocalOpenAIOAuthOptions } from "@openai-oauth/local"
+import type { PoolDiagnosticsSource } from "./pool-diagnostics.js"
 
 export type JsonValue =
 	| null
@@ -26,6 +28,7 @@ export type ChatToolDefinition = {
 		name?: string
 		description?: string
 		parameters?: JsonObject
+		strict?: boolean
 	}
 }
 
@@ -58,12 +61,16 @@ export type ChatRequest = {
 	model?: string
 	messages?: ChatMessage[]
 	stream?: boolean
+	/** Only text format is currently supported by this Chat translation. */
+	response_format?: { type?: string }
 	tools?: ChatToolDefinition[]
 	tool_choice?: ChatToolChoice
 	temperature?: number
 	top_p?: number
 	stop?: string | string[]
+	/** Legacy alias for max_completion_tokens. */
 	max_tokens?: number
+	/** Enforced by the upstream Responses output cap; maximum 128,000. */
 	max_completion_tokens?: number
 	parallel_tool_calls?: boolean
 	reasoning_effort?:
@@ -120,6 +127,26 @@ export type OpenAIOAuthServerLogEvent =
 	  }
 
 export type OpenAIOAuthServerOptions = LocalOpenAIOAuthOptions & {
+	/**
+	 * Optional credential source. When omitted, the server reads one local auth
+	 * file using the regular LocalOpenAIOAuthOptions. Supplying a credential
+	 * source makes it possible to serve a pooled or otherwise custom account
+	 * source while retaining the same OpenAI-compatible HTTP API.
+	 */
+	credentials?: OpenAIOAuth
+	/** Opt-in /pool inspection routes; the existing authorizer grants access to all accounts. */
+	poolDiagnostics?: PoolDiagnosticsSource
+	/**
+	 * Start listening before fetching the account's model catalog. The catalog is
+	 * still resolved on the first GET /v1/models request. Defaults to false.
+	 */
+	deferModelDiscovery?: boolean
+	/** Optional downstream Bearer token, checked before reading any request body. */
+	accessToken?: string
+	/** Additional header-only authorization check. Applied to every route. */
+	authorizeRequest?: (request: Request) => boolean | Promise<boolean>
+	/** Maximum request body size in bytes. Defaults to 16 MiB; positive integer. */
+	maxRequestBodyBytes?: number
 	host?: string
 	port?: number
 	models?: string[]

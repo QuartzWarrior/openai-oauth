@@ -74,6 +74,25 @@ class CodexResponsesLanguageModel implements LanguageModelV3 {
 	async doStream(
 		options: Parameters<LanguageModelV3["doStream"]>[0],
 	): Promise<Awaited<ReturnType<LanguageModelV3["doStream"]>>> {
+		// Explicit reasoning options must survive the SDK's model-name allowlist.
+		const namespace =
+			this.provider.includes("azure") && options.providerOptions?.azure != null
+				? "azure"
+				: "openai"
+		const providerOptions = options.providerOptions?.[namespace]
+		if (
+			providerOptions?.forceReasoning === undefined &&
+			(providerOptions?.reasoningEffort != null ||
+				providerOptions?.reasoningSummary != null)
+		) {
+			options = {
+				...options,
+				providerOptions: {
+					...options.providerOptions,
+					[namespace]: { ...providerOptions, forceReasoning: true },
+				},
+			}
+		}
 		const maxOutputTokens = options.maxOutputTokens
 		if (maxOutputTokens === undefined) {
 			return this.model.doStream(options)
@@ -99,7 +118,7 @@ class CodexResponsesLanguageModel implements LanguageModelV3 {
 	async doGenerate(
 		options: Parameters<LanguageModelV3["doGenerate"]>[0],
 	): Promise<Awaited<ReturnType<LanguageModelV3["doGenerate"]>>> {
-		const streamResult = await this.model.doStream(options)
+		const streamResult = await this.doStream(options)
 		const reader = streamResult.stream.getReader()
 
 		const content: Array<LanguageModelV3Content> = []
@@ -303,6 +322,9 @@ const isTransport = (
 const toTransport = (input: OpenAIOAuthProviderInput): OpenAIOAuthTransport => {
 	if (isTransport(input)) {
 		return input
+	}
+	if (input.transport) {
+		return input.transport
 	}
 
 	return createOpenAIOAuthTransport({

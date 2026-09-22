@@ -4,6 +4,53 @@ export const CODEX_IMAGE_MODEL = "gpt-image-2"
 
 const MAX_REFERENCE_IMAGES = 5
 const MAX_REFERENCE_IMAGE_BYTES = 50 * 1024 * 1024
+
+/** Local memory budgets, not upstream entitlement or context limits. */
+export type CodexImageLimits = {
+	maxReferenceImageBytes?: number
+	maxTotalImageBytes?: number
+	maxEncodedBodyBytes?: number
+}
+const resolveLimits = (limits: CodexImageLimits) => {
+	const resolved = {
+		maxReferenceImageBytes:
+			limits.maxReferenceImageBytes ?? MAX_REFERENCE_IMAGE_BYTES,
+		maxTotalImageBytes: limits.maxTotalImageBytes ?? MAX_REFERENCE_IMAGE_BYTES,
+		maxEncodedBodyBytes: limits.maxEncodedBodyBytes ?? 70 * 1024 * 1024,
+	}
+	for (const value of Object.values(resolved)) {
+		if (!Number.isSafeInteger(value) || value <= 0)
+			throw new Error("Image byte limits must be positive safe integers.")
+	}
+	return resolved
+}
+const optionError = (body: Record<string, unknown>): string | undefined => {
+	if (
+		body.n !== undefined &&
+		(typeof body.n !== "number" || !Number.isSafeInteger(body.n) || body.n < 1)
+	)
+		return "`n` must be a positive safe integer."
+	if (
+		body.background !== undefined &&
+		!["auto", "opaque", "transparent"].includes(String(body.background))
+	)
+		return "`background` must be auto, opaque, or transparent."
+	if (
+		body.quality !== undefined &&
+		!["auto", "low", "medium", "high"].includes(String(body.quality))
+	)
+		return "`quality` must be auto, low, medium, or high."
+	for (const key of ["model", "background", "quality", "size"]) {
+		if (
+			body[key] !== undefined &&
+			(typeof body[key] !== "string" || !(body[key] as string).trim())
+		)
+			return `\`${key}\` must be a non-empty string.`
+	}
+	if (body.stream !== undefined && typeof body.stream !== "boolean")
+		return "`stream` must be a boolean."
+	return undefined
+}
 const unsupportedOptions = [
 	"input_fidelity",
 	"moderation",
@@ -90,6 +137,9 @@ const normalizeGeneration = (
 		}
 	}
 
+	const validationError = optionError(body)
+	if (validationError)
+		return { body: undefined, response: errorResponse(validationError) }
 	const normalized: Record<string, unknown> = {
 		model:
 			typeof body.model === "string" && body.model.length > 0
@@ -106,6 +156,7 @@ const normalizeGeneration = (
 
 const normalizeEdit = async (
 	body: FormData,
+	limits: ReturnType<typeof resolveLimits>,
 ): Promise<PreparedCodexImageRequest> => {
 	if (body.get("stream") === "true") {
 		return {
@@ -145,12 +196,24 @@ const normalizeEdit = async (
 			),
 		}
 	}
-	const oversized = files.find((file) => file.size > MAX_REFERENCE_IMAGE_BYTES)
+	const oversized = files.find(
+		(file) => file.size > limits.maxReferenceImageBytes,
+	)
 	if (oversized) {
 		return {
 			body: undefined,
 			response: errorResponse(
-				`Reference image \`${oversized.name}\` exceeds the 50 MB limit.`,
+				"A reference image exceeds the configured per-file byte limit.",
+			),
+		}
+	}
+	if (
+		files.reduce((sum, file) => sum + file.size, 0) > limits.maxTotalImageBytes
+	) {
+		return {
+			body: undefined,
+			response: errorResponse(
+				"Reference images exceed the configured total byte limit.",
 			),
 		}
 	}
@@ -173,24 +236,64 @@ const normalizeEdit = async (
 		}
 	}
 
-	const model = body.get("model")
+	const fields: Record<string, unknown> = {}
+	for (const key of ["model", "n", "background", "quality", "size", "stream"]) {
+		const entries = body.getAll(key)
+		if (entries.length > 1)
+			return {
+				body: undefined,
+				response: errorResponse(
+					`Duplicate \`${key}\` fields are not supported.`,
+				),
+			}
+		if (entries.length === 0) continue
+		const value = entries[0]
+		if (typeof value !== "string")
+			return {
+				body: undefined,
+				response: errorResponse(`\`${key}\` must be a text field.`),
+			}
+		fields[key] =
+			key === "n"
+				? value.trim()
+					? Number(value)
+					: Number.NaN
+				: key === "stream"
+					? value === "false"
+						? false
+						: value === "true"
+							? true
+							: value
+					: value
+	}
+	const validationError = optionError(fields)
+	if (validationError)
+		return { body: undefined, response: errorResponse(validationError) }
 	const normalized: Record<string, unknown> = {
-		images: await Promise.all(
-			files.map(async (file) => ({ image_url: await fileToDataUrl(file) })),
-		),
-		model: typeof model === "string" && model ? model : CODEX_IMAGE_MODEL,
+		images: files.map((file) => ({
+			image_url: `data:${file.type || "image/png"};base64,`,
+		})),
+		model: fields.model ?? CODEX_IMAGE_MODEL,
 		prompt,
 	}
-	const n = body.get("n")
-	if (typeof n === "string" && n) {
-		const parsed = Number(n)
-		if (Number.isFinite(parsed)) normalized.n = parsed
+	for (const key of ["n", "background", "quality", "size"]) {
+		if (fields[key] !== undefined) normalized[key] = fields[key]
 	}
-	for (const key of ["background", "quality", "size"] as const) {
-		const value = body.get(key)
-		if (typeof value === "string" && value) normalized[key] = value
-	}
-
+	const encodedBytes =
+		new TextEncoder().encode(JSON.stringify(normalized)).byteLength +
+		files.reduce((sum, file) => sum + 4 * Math.ceil(file.size / 3), 0)
+	if (encodedBytes > limits.maxEncodedBodyBytes)
+		return {
+			body: undefined,
+			response: errorResponse(
+				"Encoded image request exceeds the configured byte limit.",
+			),
+		}
+	const images: Array<{ image_url: string }> = []
+	// Do not materialize every file's binary buffer concurrently.
+	for (const file of files)
+		images.push({ image_url: await fileToDataUrl(file) })
+	normalized.images = images
 	return { body: JSON.stringify(normalized) }
 }
 
@@ -198,14 +301,40 @@ export const prepareCodexImageRequest = async (
 	pathname: string,
 	headers: Headers,
 	body: BodyInit | null | undefined,
+	options: CodexImageLimits = {},
 ): Promise<PreparedCodexImageRequest> => {
+	const limits = resolveLimits(options)
 	if (pathname.endsWith("/images/generations")) {
+		const knownBytes =
+			body instanceof Blob
+				? body.size
+				: body instanceof ArrayBuffer || ArrayBuffer.isView(body)
+					? body.byteLength
+					: undefined
+		if (knownBytes !== undefined && knownBytes > limits.maxEncodedBodyBytes) {
+			return {
+				body: undefined,
+				response: errorResponse(
+					"Image generation request exceeds the configured byte limit.",
+				),
+			}
+		}
 		const bodyText = await decodeBody(body)
 		if (bodyText === undefined) {
 			return {
 				body: undefined,
 				response: errorResponse(
 					"Image generation requires a JSON request body.",
+				),
+			}
+		}
+		if (
+			new TextEncoder().encode(bodyText).byteLength > limits.maxEncodedBodyBytes
+		) {
+			return {
+				body: undefined,
+				response: errorResponse(
+					"Image generation request exceeds the configured byte limit.",
 				),
 			}
 		}
@@ -220,7 +349,20 @@ export const prepareCodexImageRequest = async (
 				}
 			}
 			headers.set("content-type", "application/json")
-			return normalizeGeneration(parsed)
+			const prepared = normalizeGeneration(parsed)
+			if (
+				typeof prepared.body === "string" &&
+				new TextEncoder().encode(prepared.body).byteLength >
+					limits.maxEncodedBodyBytes
+			) {
+				return {
+					body: undefined,
+					response: errorResponse(
+						"Normalized image generation request exceeds the configured byte limit.",
+					),
+				}
+			}
+			return prepared
 		} catch {
 			return {
 				body: undefined,
@@ -239,7 +381,7 @@ export const prepareCodexImageRequest = async (
 			}
 		}
 		headers.set("content-type", "application/json")
-		return normalizeEdit(body)
+		return normalizeEdit(body, limits)
 	}
 
 	return { body }

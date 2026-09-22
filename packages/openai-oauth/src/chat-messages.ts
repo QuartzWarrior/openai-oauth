@@ -214,6 +214,7 @@ export const createToolSet = (tools: ChatToolDefinition[] | undefined) => {
 		entries.push([
 			toolName,
 			tool({
+				strict: definition.function?.strict,
 				description: definition.function?.description,
 				inputSchema: jsonSchema(
 					definition.function?.parameters ?? {

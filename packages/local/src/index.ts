@@ -10,6 +10,8 @@ import {
 } from "./auth-file.js"
 
 export {
+	AuthFileChangedError,
+	AuthRefreshTimeoutError,
 	readAuthInstallationId,
 	resolveAuthFileCandidates,
 	resolveCodexAuthFilePath,
@@ -63,6 +65,10 @@ export const openaiCredentials = (
 				issuer: options.issuer,
 				now: options.now,
 				tokenUrl: options.tokenUrl,
+				userAgent: options.userAgent,
+				signal: options.signal,
+				refreshTimeoutMs: options.refreshTimeoutMs,
+				refreshSignal: options.refreshSignal,
 			}),
 		),
 })

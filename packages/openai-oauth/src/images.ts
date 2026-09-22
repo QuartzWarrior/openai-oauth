@@ -1,5 +1,9 @@
 import type { OpenAIOAuthTransport } from "@openai-oauth/core"
-import { copyUpstreamResponse, toErrorResponse } from "./shared.js"
+import {
+	copyUpstreamResponse,
+	RequestBodyTooLargeError,
+	toErrorResponse,
+} from "./shared.js"
 
 export const handleImageGenerationRequest = async (
 	request: Request,
@@ -27,7 +31,9 @@ export const handleImageEditRequest = async (
 	let body: FormData
 	try {
 		body = await request.formData()
-	} catch {
+	} catch (error) {
+		if (request.signal.aborted || error instanceof RequestBodyTooLargeError)
+			throw error
 		return toErrorResponse("Image editing request contains invalid form data.")
 	}
 

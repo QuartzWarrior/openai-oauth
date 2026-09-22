@@ -5,6 +5,8 @@ export type {
 	SavedAuthTokens,
 } from "./auth-file.js"
 export {
+	AuthFileChangedError,
+	AuthRefreshTimeoutError,
 	loadAuthTokens,
 	readAuthInstallationId,
 	resolveAuthFileCandidates,

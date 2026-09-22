@@ -3,6 +3,8 @@ import {
 	DEFAULT_CODEX_BASE_URL,
 	DEFAULT_CODEX_CLIENT_VERSION,
 	DEFAULT_CODEX_ORIGINATOR,
+	parseInferenceError,
+	ResponseSseCollector,
 	resolveCodexClientVersion,
 } from "@openai-oauth/core"
 
@@ -19,14 +21,6 @@ type JsonRecord = Record<string, unknown>
 const isRecord = (value: unknown): value is JsonRecord =>
 	typeof value === "object" && value !== null && !Array.isArray(value)
 
-const hasHeaderCaseInsensitive = (
-	headers: Record<string, string>,
-	name: string,
-): boolean => {
-	const lowered = name.toLowerCase()
-	return Object.keys(headers).some((key) => key.toLowerCase() === lowered)
-}
-
 export type WebsocketTransportOptions = {
 	/** Codex backend base URL (http(s)://...); converted to ws(s)://. */
 	baseURL?: string
@@ -41,11 +35,17 @@ export type WebsocketTransportOptions = {
 	terminalToken?: string
 	fetchImpl?: typeof fetch
 	now?: () => number
+	maxBufferedBytes?: number
+	maxConnections?: number
+	connectTimeoutMs?: number
+	streamIdleTimeoutMs?: number
+	requestTimeoutMs?: number
 	/** Test hook: bypass the lazy undici import. */
 	webSocketFactory?: WebSocketFactory
 }
 
 export type WebsocketConnectionIdentity = {
+	isFedRamp?: boolean
 	accountId: string
 	installationId: string
 	/** Per-conversation id (thread id when distinct). */
@@ -57,6 +57,10 @@ export type WebsocketConnectionIdentity = {
 }
 
 export type WebsocketIdentity = {
+	/** Fully prepared Responses URL, including provider query parameters. */
+	url?: string
+	isFedRamp?: boolean
+	signal?: AbortSignal
 	accountId: string
 	installationId: string
 	/** Per-conversation id; falls back to installationId. */
@@ -77,10 +81,11 @@ export type WebsocketIdentity = {
 	 * models-shaped requests.
 	 */
 	turnId?: string
+	responsesLite?: boolean
 }
 
 export type WebsocketTransport = {
-	/** Whether the last failure should fall back to HTTP (always true). */
+	/** Legacy capability marker; callers must not replay an exchange after output. */
 	readonly fallbackToHttp: true
 	streamResponse(
 		requestBody: JsonRecord,
@@ -155,7 +160,16 @@ export const buildWebsocketUpgradeHeaders = (
 	if (identity.windowId !== undefined) {
 		headers["x-codex-window-id"] = identity.windowId
 	}
-	return { ...headers, ...extraHeaders }
+	// Preserve familiar casing for exported header objects, but never allow
+	// account-routing overrides from additional headers.
+	const result = { ...headers, ...extraHeaders }
+	for (const name of Object.keys(result)) {
+		if (["chatgpt-account-id", "x-openai-fedramp"].includes(name.toLowerCase()))
+			delete result[name]
+	}
+	result["chatgpt-account-id"] = identity.accountId
+	if (identity.isFedRamp) result["x-openai-fedramp"] = "true"
+	return result
 }
 
 const toWebsocketUrl = (baseURL: string | undefined): string => {
@@ -163,10 +177,8 @@ const toWebsocketUrl = (baseURL: string | undefined): string => {
 	base.protocol = base.protocol === "http:" ? "ws:" : "wss:"
 	// Codex authenticates the upgrade with headers (add_auth_headers), never a
 	// query token — tokens in URLs leak into logs/proxies and mark the client.
-	return new URL(
-		`${base.pathname.replace(/\/$/, "")}/responses`,
-		`${base.protocol}//${base.host}`,
-	).toString()
+	base.pathname = `${base.pathname.replace(/\/$/, "")}/responses`
+	return base.toString()
 }
 
 type Timers = {
@@ -217,572 +229,634 @@ const pickClientMetadata = (
 	if (identity.turnId !== undefined) {
 		metadata.turn_id = identity.turnId
 	}
+	if (identity.responsesLite)
+		metadata.ws_request_header_x_openai_internal_codex_responses_lite = "true"
 	return metadata
 }
 
+type PendingExchange = {
+	onFrame(frame: JsonRecord): void
+	fail(error: Error): void
+}
+
+const errorOf = (value: unknown): Error =>
+	value instanceof Error ? value : new Error("Websocket operation failed.")
+
+/** Wrapped errors carry HTTP policy metadata, not arbitrary response headers. */
+const wrappedErrorHeaders = (value: unknown): Headers => {
+	const headers = new Headers()
+	if (!isRecord(value)) return headers
+	for (const [name, raw] of Object.entries(value)) {
+		const key = name.toLowerCase()
+		if (!["retry-after", "x-codex-active-limit", "x-request-id"].includes(key))
+			continue
+		const text =
+			typeof raw === "string"
+				? raw
+				: typeof raw === "number" && Number.isFinite(raw)
+					? String(raw)
+					: undefined
+		if (text === undefined || text.length > 256 || /[^\x20-\x7e]/.test(text))
+			continue
+		headers.set(key, text)
+	}
+	return headers
+}
+
+const semanticKey = (body: JsonRecord): string =>
+	JSON.stringify(
+		Object.fromEntries(
+			Object.entries(body)
+				.filter(
+					([key]) =>
+						!["input", "previous_response_id", "client_metadata"].includes(key),
+				)
+				.sort(([a], [b]) => a.localeCompare(b)),
+		),
+	)
+
 export class WebsocketConnection {
-	private socket: UndiciWebSocket | undefined
-	/** Socket currently in handshake (open not yet fired); close() aborts it. */
-	private pendingSocket: UndiciWebSocket | undefined
-	private connectPromise: Promise<UndiciWebSocket> | undefined
-	private readonly identity: WebsocketIdentity
-	private readonly options: WebsocketConnectionOptions
-	private readonly timers: Timers
-	private codexVersion: string | undefined
-	private codexVersionPromise: Promise<string> | undefined
-	private idleTimer: ReturnType<typeof setTimeout> | undefined
-	private lastActivityAt: number
+	private socket?: UndiciWebSocket
+	private pendingSocket?: UndiciWebSocket
+	private handshakeReject?: (error: Error) => void
 	private closed = false
-	/** Monotonic count of completed responses, for single-flight prewarm. */
-	private inflightRequests = 0
-	private lastResponseInput: unknown[] | undefined
-	private lastResponseId: string | undefined
+	private readonly lifecycle = new AbortController()
+	private idleTimer?: ReturnType<typeof setTimeout>
+	private readonly timers: Timers
+	private active?: PendingExchange
+	private busy = false
+	private readonly slots: Array<{
+		resolve(): void
+		reject(error: Error): void
+		signal?: AbortSignal
+		abort(): void
+	}> = []
+	private warmSent = false
+	private last?: { id: string; history: unknown[]; key: string }
 
 	constructor(
-		identity: WebsocketIdentity,
-		options: WebsocketConnectionOptions = {},
+		private readonly identity: WebsocketIdentity,
+		private readonly options: WebsocketConnectionOptions = {},
 	) {
-		this.identity = identity
-		this.options = options
 		this.timers = options.timers ?? defaultTimers
-		this.lastActivityAt = (options.now ?? Date.now)()
 	}
 
-	private now(): number {
-		return (this.options.now ?? Date.now)()
+	get isIdle(): boolean {
+		return !this.busy && this.slots.length === 0
 	}
 
-	private async resolveCodexVersion(): Promise<string> {
-		if (this.codexVersion) {
-			return this.codexVersion
+	private async acquire(signal?: AbortSignal): Promise<void> {
+		if (this.closed) throw new Error("Websocket connection is closed.")
+		if (signal?.aborted) throw errorOf(signal.reason)
+		if (!this.busy) {
+			this.busy = true
+			return
 		}
-		this.codexVersionPromise ??= resolveCodexClientVersion({
+		if (this.slots.length >= 128)
+			throw new Error("Websocket request queue is full.")
+		await new Promise<void>((resolve, reject) => {
+			const slot = {
+				resolve,
+				reject,
+				signal,
+				abort: () => {
+					const index = this.slots.indexOf(slot)
+					if (index >= 0) this.slots.splice(index, 1)
+					reject(errorOf(signal?.reason))
+				},
+			}
+			this.slots.push(slot)
+			signal?.addEventListener("abort", slot.abort, { once: true })
+		})
+	}
+
+	private release(): void {
+		const slot = this.slots.shift()
+		if (slot) {
+			slot.signal?.removeEventListener("abort", slot.abort)
+			slot.resolve()
+		} else {
+			this.busy = false
+			this.armIdle()
+		}
+	}
+
+	private armIdle(): void {
+		if (this.idleTimer) this.timers.clearTimeout(this.idleTimer)
+		if (this.closed || !this.socket || this.busy) return
+		this.idleTimer = this.timers.setTimeout(() => {
+			if (!this.busy) this.disconnect(new Error("Websocket idle timeout."))
+		}, WS_IDLE_TIMEOUT_MS)
+	}
+
+	private disconnect(error: Error): void {
+		this.last = undefined
+		if (this.idleTimer) this.timers.clearTimeout(this.idleTimer)
+		this.handshakeReject?.(error)
+		const socket = this.socket ?? this.pendingSocket
+		this.socket = undefined
+		this.pendingSocket = undefined
+		this.active?.fail(error)
+		try {
+			socket?.close()
+		} catch {}
+	}
+
+	private async connect(
+		accessToken: string,
+		signal?: AbortSignal,
+	): Promise<UndiciWebSocket> {
+		const attempt = new AbortController()
+		let rejectAbort: (error: Error) => void = () => {}
+		const aborted = new Promise<never>((_, reject) => {
+			rejectAbort = reject
+		})
+		const abort = () => {
+			const error = errorOf(
+				signal?.aborted ? signal.reason : this.lifecycle.signal.reason,
+			)
+			attempt.abort(error)
+			rejectAbort(error)
+		}
+		signal?.addEventListener("abort", abort, { once: true })
+		this.lifecycle.signal.addEventListener("abort", abort, { once: true })
+		const timer = this.timers.setTimeout(() => {
+			const error = new Error("Timed out opening the Codex websocket.")
+			attempt.abort(error)
+			rejectAbort(error)
+		}, this.options.connectTimeoutMs ?? WS_CONNECT_TIMEOUT_MS)
+		if (signal?.aborted || this.lifecycle.signal.aborted) abort()
+		try {
+			return await Promise.race([
+				this.open(accessToken, attempt.signal),
+				aborted,
+			])
+		} finally {
+			this.timers.clearTimeout(timer)
+			signal?.removeEventListener("abort", abort)
+			this.lifecycle.signal.removeEventListener("abort", abort)
+		}
+	}
+
+	private async open(
+		accessToken: string,
+		signal?: AbortSignal,
+	): Promise<UndiciWebSocket> {
+		if (this.closed) throw new Error("Websocket connection is closed.")
+		if (signal?.aborted) throw errorOf(signal.reason)
+		if (this.socket?.readyState === 1) return this.socket
+		const codexVersion = await resolveCodexClientVersion({
 			codexVersion: this.options.codexVersion,
 			fetchImpl: this.options.fetchImpl ?? globalThis.fetch?.bind(globalThis),
-		})
-			.then((version: string) => {
-				this.codexVersion = version
-				return version
-			})
-			// On registry-fetch failure fall back to the pinned core build version so the
-			// handshake UA never disagrees with this account's HTTP data-path version.
-			.catch((): string => DEFAULT_CODEX_CLIENT_VERSION)
-		return this.codexVersionPromise
-	}
-
-	private async connect(accessToken: string): Promise<UndiciWebSocket> {
-		if (this.closed) {
-			throw new Error("Websocket connection is closed.")
-		}
-		if (this.socket && this.socket.readyState === 1) {
-			return this.socket
-		}
-		// Assigned synchronously, before any await: concurrent prewarm/stream
-		// callers must share the one in-flight handshake. Resolving the codex
-		// version (or the undici import) first would leave a window where
-		// connectPromise is still undefined and a second caller opens a second
-		// socket for the same connection identity.
-		this.connectPromise ??= this.open(accessToken).finally(() => {
-			this.connectPromise = undefined
-		})
-		return this.connectPromise
-	}
-
-	private async open(accessToken: string): Promise<UndiciWebSocket> {
-		const url = toWebsocketUrl(this.options.baseURL)
-		const codexVersion = await this.resolveCodexVersion()
+		}).catch(() => DEFAULT_CODEX_CLIENT_VERSION)
+		if (this.closed || signal?.aborted) throw errorOf(signal?.reason)
 		const headers = buildWebsocketUpgradeHeaders(
 			this.identity,
 			codexVersion,
 			this.options.headers,
 			this.options.terminalToken,
 		)
-		// Codex's add_auth_headers on the upgrade: bearer + account id as headers.
-		// extraHeaders (per-account overrides) may legitimately replace these.
-		if (!hasHeaderCaseInsensitive(headers, "authorization")) {
-			headers.Authorization = `Bearer ${accessToken}`
-		}
-		const factory: WebSocketFactory =
+		for (const name of Object.keys(headers))
+			if (name.toLowerCase() === "authorization") delete headers[name]
+		headers.Authorization = `Bearer ${accessToken}`
+		const factory =
 			this.options.webSocketFactory ??
-			(async (target, upgradeHeaders) => {
+			(async (url: string, values: Record<string, string>) => {
 				const undici = await loadUndici()
-				if (!undici) {
-					throw new Error(
-						'The websocket transport requires undici (Node.js >= 20). Omit `transport: "websocket"` or install undici for other runtimes.',
-					)
-				}
-				return new undici.WebSocket(target, { headers: upgradeHeaders })
+				if (!undici) throw new Error("Websocket transport requires undici.")
+				return new undici.WebSocket(url, { headers: values })
 			})
-
-		const socket = await Promise.resolve(factory(url, headers))
-		this.pendingSocket = socket
-		try {
-			await this.waitForOpen(socket)
-		} finally {
-			this.pendingSocket = undefined
-		}
-		if (this.closed) {
+		const target = this.identity.url
+			? new URL(this.identity.url)
+			: new URL(toWebsocketUrl(this.options.baseURL))
+		target.protocol =
+			target.protocol === "http:" || target.protocol === "ws:" ? "ws:" : "wss:"
+		const socket = await factory(target.toString(), headers)
+		if (this.closed || signal?.aborted) {
 			socket.close()
-			throw new Error("Websocket connection closed during handshake.")
+			throw new Error("Websocket connection is closed or aborted.")
 		}
+		this.pendingSocket = socket
+		await new Promise<void>((resolve, reject) => {
+			let done = false
+			const finish = (error?: Error) => {
+				if (done) return
+				done = true
+				this.timers.clearTimeout(timer)
+				signal?.removeEventListener("abort", abort)
+				this.handshakeReject = undefined
+				if (error) {
+					socket.close()
+					reject(error)
+				} else resolve()
+			}
+			const abort = () => finish(errorOf(signal?.reason))
+			const timer = this.timers.setTimeout(
+				() => finish(new Error("Timed out opening the Codex websocket.")),
+				this.options.connectTimeoutMs ?? WS_CONNECT_TIMEOUT_MS,
+			)
+			this.handshakeReject = (error) => finish(error)
+			socket.addEventListener("open", () => finish())
+			socket.addEventListener("error", () =>
+				finish(new Error("Codex websocket handshake failed.")),
+			)
+			socket.addEventListener("close", () =>
+				finish(new Error("Codex websocket closed during handshake.")),
+			)
+			signal?.addEventListener("abort", abort, { once: true })
+			if (socket.readyState === 1) finish()
+			if (signal?.aborted) abort()
+		})
+		this.pendingSocket = undefined
 		this.socket = socket
-		this.attachSocketHandlers(socket)
-		this.armIdleTimer()
+		socket.binaryType = "arraybuffer"
+		socket.addEventListener("message", (event) => {
+			if (socket !== this.socket) return
+			const data = (event as { data: unknown }).data
+			const text =
+				typeof data === "string"
+					? data
+					: data instanceof ArrayBuffer || ArrayBuffer.isView(data)
+						? new TextDecoder().decode(data)
+						: undefined
+			if (text === undefined) {
+				this.disconnect(new Error("Unsupported websocket message."))
+				return
+			}
+			if (
+				new TextEncoder().encode(text).byteLength >
+				(this.options.maxBufferedBytes ?? 1024 * 1024)
+			) {
+				this.disconnect(new Error("Websocket frame exceeds buffer budget."))
+				return
+			}
+			try {
+				const frame: unknown = JSON.parse(text)
+				if (!isRecord(frame)) throw new Error("Invalid websocket frame.")
+				this.active?.onFrame(frame)
+			} catch (error) {
+				this.disconnect(errorOf(error))
+			}
+		})
+		socket.addEventListener("close", () => {
+			if (socket === this.socket)
+				this.disconnect(new Error("Websocket closed before completion."))
+		})
+		socket.addEventListener("error", () => {
+			if (socket === this.socket)
+				this.disconnect(new Error("Websocket transport error."))
+		})
 		return socket
 	}
 
-	private waitForOpen(socket: UndiciWebSocket): Promise<void> {
-		return new Promise((resolve, reject) => {
-			const timeout = this.timers.setTimeout(() => {
-				reject(new Error("Timed out opening the Codex websocket."))
-			}, WS_CONNECT_TIMEOUT_MS)
-			socket.addEventListener("open", () => {
-				this.timers.clearTimeout(timeout)
-				resolve()
-			})
-			socket.addEventListener("error", () => {
-				this.timers.clearTimeout(timeout)
-				reject(new Error("Codex websocket handshake failed."))
-			})
-			socket.addEventListener("close", () => {
-				this.timers.clearTimeout(timeout)
-				reject(new Error("Codex websocket closed during handshake."))
-			})
-		})
-	}
-
-	private attachSocketHandlers(socket: UndiciWebSocket): void {
-		socket.binaryType = "arraybuffer"
-		socket.addEventListener("message", (event) => {
-			this.lastActivityAt = this.now()
-			this.handleMessage(event as { data: unknown; type: string })
-		})
-		socket.addEventListener("close", () => {
-			this.tearDown(socket)
-		})
-		socket.addEventListener("error", () => {
-			this.tearDown(socket)
-		})
-	}
-
-	private tearDown(socket: UndiciWebSocket | undefined): void {
-		if (this.idleTimer) {
-			this.timers.clearTimeout(this.idleTimer)
-			this.idleTimer = undefined
-		}
-		if (socket === undefined || socket === this.socket) {
-			this.socket = undefined
-		}
-		try {
-			socket?.close()
-		} catch {}
-	}
-
-	private armIdleTimer(): void {
-		if (this.idleTimer) {
-			this.timers.clearTimeout(this.idleTimer)
-		}
-		this.idleTimer = this.timers.setTimeout(() => {
-			const idleFor = this.now() - this.lastActivityAt
-			if (idleFor >= WS_IDLE_TIMEOUT_MS && this.inflightRequests === 0) {
-				this.tearDown(this.socket)
-			} else {
-				this.armIdleTimer()
-			}
-		}, WS_IDLE_TIMEOUT_MS)
-	}
-
-	private readonly waiters: Array<{
-		predicate: (frame: JsonRecord) => boolean
-		resolve: (frame: JsonRecord) => void
-		reject: (error: Error) => void
-		timer: ReturnType<typeof setTimeout>
-	}> = []
-
-	private handleMessage(event: { data: unknown }): void {
-		let text: string | undefined
-		if (typeof event.data === "string") {
-			text = event.data
-		} else if (event.data instanceof ArrayBuffer) {
-			text = new TextDecoder().decode(event.data)
-		} else if (ArrayBuffer.isView(event.data)) {
-			text = new TextDecoder().decode(event.data)
-		}
-		if (text === undefined) {
-			return
-		}
-		let frame: JsonRecord
-		try {
-			const parsed: unknown = JSON.parse(text)
-			if (!isRecord(parsed)) {
-				return
-			}
-			frame = parsed
-		} catch {
-			return
-		}
-		for (const waiter of [...this.waiters]) {
-			if (waiter.predicate(frame)) {
-				this.timers.clearTimeout(waiter.timer)
-				this.waiters.splice(this.waiters.indexOf(waiter), 1)
-				waiter.resolve(frame)
-			}
-		}
-	}
-
-	private awaitFrame(
-		predicate: (frame: JsonRecord) => boolean,
-		timeoutMs: number,
-		label: string,
-	): Promise<JsonRecord> {
-		return new Promise((resolve, reject) => {
-			const timer = this.timers.setTimeout(() => {
-				const index = this.waiters.findIndex((waiter) => waiter.timer === timer)
-				if (index >= 0) {
-					this.waiters.splice(index, 1)
-				}
-				reject(new Error(`Timed out waiting for ${label} over websocket.`))
-			}, timeoutMs)
-			this.waiters.push({ predicate, resolve, reject, timer })
-		})
-	}
-
-	/**
-	 * Single-flight prewarm: opens the socket and sends one `response.create`
-	 * with `generate: false` so the per-connection model context warms without
-	 * spending a turn. Concurrent prewarms share the same handshake; the warm
-	 * frame is sent exactly once for the whole connection lifetime.
-	 */
-	private warmSent = false
-
 	prewarm(accessToken: string): void {
-		if (this.closed) {
-			return
-		}
-		// Claim the warm frame synchronously: concurrent prewarm calls (or a
-		// prewarm racing a request's own warm-up) must not each send a
-		// `generate: false` frame.
-		const shouldWarm = !this.warmSent
+		if (this.warmSent || this.closed) return
 		this.warmSent = true
-		void this.connect(accessToken)
-			.then((socket) => {
-				if (!shouldWarm || this.closed || socket.readyState !== 1) {
-					return
+		// Warmup is an exchange, not a fire-and-forget frame: consume its terminal
+		// event before another request can own this socket.
+		void this.exchange(
+			{ stream: true, generate: false },
+			accessToken,
+			this.identity,
+			true,
+		)
+			.then(async (stream) => {
+				const reader = stream.getReader()
+				try {
+					while (!(await reader.read()).done) {}
+				} finally {
+					reader.releaseLock()
 				}
-				const lastInput = this.lastResponseInput
-				const baseBody = lastInput
-					? { input: lastInput, stream: true }
-					: { stream: true }
-				socket.send(
-					JSON.stringify({
-						...baseBody,
-						type: RESPONSE_CREATE_TYPE,
-						client_metadata: pickClientMetadata(this.identity),
-						generate: false,
-					}),
-				)
 			})
-			.catch(() => this.tearDown(this.socket))
+			.catch(() => undefined)
 	}
 
-	/**
-	 * Runs one streamed response over the shared socket. Reuses the previous
-	 * turn's input via incremental `input_text.delta` frames when the new input
-	 * extends it (same conversation on the same account); otherwise a full
-	 * `response.create` is sent. Resolves with the mapped SSE byte stream.
-	 */
-	async streamResponse(
+	streamResponse(
 		requestBody: JsonRecord,
 		accessToken: string,
+		identity = this.identity,
 	): Promise<ReadableStream<Uint8Array>> {
-		if (this.closed) {
-			throw new Error("Websocket connection is closed.")
-		}
-		const socket = await this.connect(accessToken)
-		if (socket.readyState !== 1) {
-			throw new Error("Codex websocket is not open.")
-		}
+		return this.exchange(requestBody, accessToken, identity, false)
+	}
 
-		this.inflightRequests += 1
+	private async exchange(
+		requestBody: JsonRecord,
+		accessToken: string,
+		identity: WebsocketIdentity,
+		warm: boolean,
+	): Promise<ReadableStream<Uint8Array>> {
+		await this.acquire(identity.signal)
+		let socket: UndiciWebSocket
+		try {
+			socket = await this.connect(accessToken, identity.signal)
+		} catch (error) {
+			this.release()
+			throw error
+		}
 		const encoder = new TextEncoder()
-		const responseIdPromise = this.awaitFrame(
-			(frame) =>
-				frame.type === "response.created" ||
-				frame.type === "response.completed",
-			WS_RESPONSE_TIMEOUT_MS,
-			"a response id",
-		)
-
 		const input = Array.isArray(requestBody.input)
-			? (requestBody.input as unknown[])
+			? requestBody.input
 			: undefined
-		const reuseDelta =
-			input !== undefined &&
-			this.lastResponseInput !== undefined &&
-			input.length >= this.lastResponseInput.length &&
-			this.lastResponseInput.every(
+		const key = `${semanticKey(requestBody)}:${identity.responsesLite === true}`
+		const last = this.last
+		const reuse =
+			!warm &&
+			requestBody.previous_response_id === undefined &&
+			last &&
+			input &&
+			key === last.key &&
+			input.length >= last.history.length &&
+			last.history.every(
 				(item, index) => JSON.stringify(item) === JSON.stringify(input[index]),
 			)
-
-		// Codex sends one ResponsesWsRequest::ResponseCreate frame per turn and
-		// nothing else (no incremental delta frames): the full request fields plus
-		// `prompt_cache_key`, `previous_response_id` chained to the last response,
-		// and when the new input is a strict extension of the previous, only the
-		// incremental input items. Extras a real codex client_metadata carries
-		// (trace/turn ids) are absent here just as codex omits them when unset.
+		const metadata = {
+			...(isRecord(requestBody.client_metadata)
+				? requestBody.client_metadata
+				: {}),
+			...pickClientMetadata(identity),
+		}
 		const frame: JsonRecord = {
 			...requestBody,
 			type: RESPONSE_CREATE_TYPE,
-			client_metadata: pickClientMetadata(this.identity),
 			stream: true,
+			client_metadata: metadata,
 		}
-		if (this.lastResponseId !== undefined) {
-			frame.previous_response_id = this.lastResponseId
+		if (reuse) {
+			frame.previous_response_id = last.id
+			frame.input = input.slice(last.history.length)
 		}
-		if (
-			reuseDelta &&
-			input !== undefined &&
-			this.lastResponseInput !== undefined
-		) {
-			frame.input = input.slice(this.lastResponseInput.length)
+		if (!warm) delete frame.generate
+		const collector = new ResponseSseCollector()
+		let settled = false
+		let started = false
+		let done = false
+		let failure: Error | undefined
+		let bytes = 0
+		const queue: Uint8Array[] = []
+		let wake: (() => void) | undefined
+		let resolveStarted: () => void = () => {}
+		let rejectStarted: (error: Error) => void = () => {}
+		const startPromise = new Promise<void>((resolve, reject) => {
+			resolveStarted = resolve
+			rejectStarted = reject
+		})
+		const notify = () => {
+			wake?.()
+			wake = undefined
 		}
-		// `generate` is only ever set on the single prewarm frame (false); turn
-		// frames leave it unset, matching codex (Some(false) iff warmup).
-		socket.send(JSON.stringify(frame))
-		if (input !== undefined) {
-			this.lastResponseInput = input
+		const finish = () => {
+			if (settled) return
+			settled = true
+			if (timer) this.timers.clearTimeout(timer)
+			if (idleTimer) this.timers.clearTimeout(idleTimer)
+			identity.signal?.removeEventListener("abort", abort)
+			this.active = undefined
+			this.release()
+			notify()
 		}
-
-		const sseQueue: Uint8Array[] = []
-		let streamError: Error | undefined
-		let streamDone = false
-		let wakeConsumer: (() => void) | undefined
-		const notify = (): void => {
-			wakeConsumer?.()
-			wakeConsumer = undefined
+		const fail = (error: Error) => {
+			if (settled) return
+			failure = error
+			done = true
+			this.last = undefined
+			queue.length = 0
+			bytes = 0
+			if (!started) rejectStarted(error)
+			finish()
 		}
-
-		const streamWaiter = {
-			predicate: (frame: JsonRecord): boolean => {
-				const frameType = typeof frame.type === "string" ? frame.type : ""
-				if (!frameType.startsWith("response.")) {
-					return false
+		const abort = () =>
+			this.disconnect(
+				errorOf(
+					identity.signal?.reason ?? new DOMException("Aborted", "AbortError"),
+				),
+			)
+		let idleTimer: ReturnType<typeof setTimeout> | undefined
+		const resetIdle = () => {
+			if (idleTimer) this.timers.clearTimeout(idleTimer)
+			// A full downstream queue is backpressure, not upstream silence.
+			if (!settled && bytes === 0)
+				idleTimer = this.timers.setTimeout(
+					() => this.disconnect(new Error("Websocket response idle timeout.")),
+					this.options.streamIdleTimeoutMs ?? WS_RESPONSE_TIMEOUT_MS,
+				)
+		}
+		const timer =
+			this.options.requestTimeoutMs === undefined
+				? undefined
+				: this.timers.setTimeout(
+						() =>
+							this.disconnect(new Error("Websocket total request timeout.")),
+						this.options.requestTimeoutMs,
+					)
+		resetIdle()
+		this.active = {
+			fail,
+			onFrame: (event) => {
+				const type = typeof event.type === "string" ? event.type : ""
+				resetIdle()
+				if (type === "error") {
+					this.disconnect(
+						parseInferenceError(event, {
+							headers: wrappedErrorHeaders(event.headers),
+							responseStarted: started,
+							now: this.options.now?.(),
+						}),
+					)
+					return
 				}
-				const payload: JsonRecord = isRecord(frame.response)
-					? frame.response
-					: frame
-				sseQueue.push(
-					encoder.encode(
-						`event: ${frameType}\ndata: ${JSON.stringify(payload)}\n\n`,
-					),
+				if (
+					!type.startsWith("response.") &&
+					type !== "codex.rate_limits" &&
+					type !== "codex.response.metadata"
+				)
+					return
+				if (type === "codex.response.metadata") {
+					const headers: Record<string, string> = {}
+					if (isRecord(event.headers)) {
+						for (const [name, value] of Object.entries(event.headers)) {
+							if (
+								name.toLowerCase() === "x-models-etag" &&
+								typeof value === "string" &&
+								value.length <= 256 &&
+								/^[\x20-\x7e]+$/.test(value)
+							)
+								headers["x-models-etag"] = value
+						}
+					}
+					if (!headers["x-models-etag"]) return
+					event = { type, headers }
+				}
+				if (type.startsWith("response."))
+					collector.accept({ event: type, data: JSON.stringify(event) })
+				const chunk = encoder.encode(
+					`event: ${type}\ndata: ${JSON.stringify(event)}\n\n`,
 				)
 				if (
-					frameType === "response.completed" ||
-					frameType === "response.failed" ||
-					frameType === "response.incomplete"
+					bytes + chunk.byteLength >
+					(this.options.maxBufferedBytes ?? 1024 * 1024)
 				) {
-					const id =
-						typeof payload.id === "string"
-							? payload.id
-							: typeof payload.response_id === "string"
-								? payload.response_id
+					this.disconnect(
+						new Error("Websocket response exceeds buffer budget."),
+					)
+					return
+				}
+				queue.push(chunk)
+				bytes += chunk.byteLength
+				resetIdle()
+				if (!started) {
+					started = true
+					resolveStarted()
+				}
+				if (
+					[
+						"response.completed",
+						"response.failed",
+						"response.incomplete",
+					].includes(type)
+				) {
+					const response = collector.finish()
+					if (
+						!warm &&
+						requestBody.previous_response_id === undefined &&
+						type === "response.completed" &&
+						response.status === "completed" &&
+						typeof response.id === "string" &&
+						input
+					) {
+						const history = [
+							...input,
+							...(Array.isArray(response.output) ? response.output : []),
+						]
+						this.last =
+							encoder.encode(JSON.stringify(history)).byteLength <=
+							(this.options.maxBufferedBytes ?? 1024 * 1024)
+								? { id: response.id, history: structuredClone(history), key }
 								: undefined
-					if (id !== undefined) {
-						this.lastResponseId = id
-					}
-					sseQueue.push(encoder.encode("data: [DONE]\n\n"))
-					streamDone = true
+					} else this.last = undefined
+					queue.push(encoder.encode("data: [DONE]\n\n"))
+					done = true
+					finish()
 				}
 				notify()
-				return false
 			},
-			resolve: () => {},
-			reject: () => {},
-			timer: this.timers.setTimeout(() => {
-				streamError = new Error("Timed out streaming the websocket response.")
-				streamDone = true
-				notify()
-			}, WS_RESPONSE_TIMEOUT_MS),
 		}
-		this.waiters.push(streamWaiter)
-
-		const cleanup = (): void => {
-			this.timers.clearTimeout(streamWaiter.timer)
-			const index = this.waiters.indexOf(streamWaiter)
-			if (index >= 0) {
-				this.waiters.splice(index, 1)
+		identity.signal?.addEventListener("abort", abort, { once: true })
+		if (identity.signal?.aborted) abort()
+		else
+			try {
+				socket.send(JSON.stringify(frame))
+			} catch (error) {
+				this.disconnect(errorOf(error))
 			}
-			this.inflightRequests = Math.max(0, this.inflightRequests - 1)
-			this.lastActivityAt = this.now()
-		}
-
-		const stream = new ReadableStream<Uint8Array>({
-			pull: async (controller) => {
-				for (;;) {
-					const chunk = sseQueue.shift()
-					if (chunk !== undefined) {
-						controller.enqueue(chunk)
-						return
+		await startPromise
+		return new ReadableStream<Uint8Array>(
+			{
+				async pull(controller) {
+					for (;;) {
+						const chunk = queue.shift()
+						if (chunk) {
+							bytes -= chunk.byteLength
+							resetIdle()
+							controller.enqueue(chunk)
+							return
+						}
+						if (failure) {
+							controller.error(failure)
+							return
+						}
+						if (done) {
+							controller.close()
+							return
+						}
+						await new Promise<void>((resolve) => {
+							wake = resolve
+						})
 					}
-					if (streamError !== undefined) {
-						cleanup()
-						controller.error(streamError)
-						return
-					}
-					if (streamDone) {
-						cleanup()
-						controller.close()
-						return
-					}
-					await new Promise<void>((resolve) => {
-						wakeConsumer = resolve
-					})
-				}
+				},
+				cancel: () => {
+					if (!done) this.disconnect(new Error("Websocket response cancelled."))
+					queue.length = 0
+					bytes = 0
+					done = true
+					notify()
+				},
 			},
-			cancel: () => {
-				cleanup()
-				notify()
-			},
-		})
-
-		try {
-			const created = await responseIdPromise
-			void created
-		} catch (error) {
-			cleanup()
-			throw error instanceof Error
-				? error
-				: new Error("Codex websocket response failed to start.")
-		}
-
-		return stream
+			{ highWaterMark: 0 },
+		)
 	}
 
 	async close(): Promise<void> {
 		this.closed = true
-		// Abort an in-flight handshake: the "close" listener registered by
-		// waitForOpen rejects its promise, so streamResponse surfaces the close
-		// instead of hanging until the handshake timeout.
-		this.pendingSocket?.close()
-		this.tearDown(this.socket)
+		this.lifecycle.abort(new Error("Websocket connection is closed."))
+		for (const slot of this.slots.splice(0)) {
+			slot.signal?.removeEventListener("abort", slot.abort)
+			slot.reject(new Error("Websocket connection is closed."))
+		}
+		this.disconnect(new Error("Websocket connection is closed."))
 	}
 }
 
-export type WebsocketConnectionManagerOptions = WebsocketTransportOptions & {
-	headers?: Record<string, string>
-}
+export type WebsocketConnectionManagerOptions = WebsocketTransportOptions
 
-/**
- * Owns one websocket per (account, access token) so every account in the pool
- * keeps an isolated connection, handshake identity, and idle lifecycle.
- */
 export class WebsocketConnectionManager {
 	private readonly connections = new Map<string, WebsocketConnection>()
-	private readonly options: WebsocketConnectionManagerOptions
-	/** Set on close(): a closed manager never opens a new connection again. */
-	private managerClosed = false
-	constructor(options: WebsocketConnectionManagerOptions = {}) {
-		this.options = options
-	}
-
-	private keyFor(identity: WebsocketConnectionIdentity, accessToken: string) {
-		// Per-conversation socket: Codex's session-id is the thread id, and one
-		// connection serves one conversation lifecycle — a single socket claiming
-		// the same session-id across disjoint conversations is a pool-only
-		// pattern. The token slice rebinds a conversation's socket on refresh.
-		return `${identity.accountId}:${identity.sessionId ?? identity.installationId}:${accessToken.slice(-24)}`
-	}
+	private closed = false
+	constructor(
+		private readonly options: WebsocketConnectionManagerOptions = {},
+	) {}
 
 	connectionFor(
 		identity: WebsocketIdentity,
 		accessToken: string,
 	): WebsocketConnection {
-		const key = this.keyFor(identity, accessToken)
-		if (!this.managerClosed) {
-			let connection = this.connections.get(key)
-			if (connection === undefined) {
-				connection = new WebsocketConnection(identity, this.options)
-				// Keep at most one live socket per account besides the new one:
-				// e.g. a prior conversation's socket past its turn, or a prewarm
-				// keyed to an older access token.
-				let kept = false
-				for (const [existingKey, existing] of this.connections) {
-					if (!existingKey.startsWith(`${identity.accountId}:`)) {
-						continue
-					}
-					if (!kept) {
-						kept = true
-						continue
-					}
-					this.connections.delete(existingKey)
-					void existing.close()
-				}
-				this.connections.set(key, connection)
+		if (this.closed) throw new Error("Websocket manager is closed.")
+		const key = JSON.stringify([
+			identity.accountId,
+			identity.url,
+			identity.isFedRamp === true,
+			identity.sessionId ?? identity.installationId,
+			accessToken,
+		])
+		let connection = this.connections.get(key)
+		if (!connection) {
+			const limit = this.options.maxConnections ?? 64
+			if (this.connections.size >= limit) {
+				const idle = [...this.connections].find(([, value]) => value.isIdle)
+				if (!idle) throw new Error("Websocket connection limit reached.")
+				this.connections.delete(idle[0])
+				void idle[1].close()
 			}
-			return connection
+			connection = new WebsocketConnection(identity, this.options)
+			this.connections.set(key, connection)
 		}
-		// After close() there is no connection to hand out; a session-level
-		// already-closed marker preserves the "connection is closed" contract
-		// for late streamResponse callers instead of silently reconnecting.
-		return this.closedConnection(identity)
-	}
-
-	closedConnection(identity: WebsocketConnectionIdentity): WebsocketConnection {
-		const connection = new WebsocketConnection(
-			{
-				accountId: identity.accountId,
-				installationId: identity.installationId,
-				sessionId: identity.sessionId,
-			},
-			this.options,
-		)
-		void connection.close()
 		return connection
 	}
 
 	prewarm(identity: WebsocketConnectionIdentity, accessToken: string): void {
-		if (this.managerClosed) {
-			return
-		}
-		this.connectionFor(identity, accessToken).prewarm(accessToken)
+		if (!this.closed)
+			this.connectionFor(identity, accessToken).prewarm(accessToken)
 	}
 
 	async close(): Promise<void> {
-		this.managerClosed = true
-		const closing = [...this.connections.values()].map((connection) =>
-			connection.close(),
+		this.closed = true
+		await Promise.all(
+			[...this.connections.values()].map((connection) => connection.close()),
 		)
 		this.connections.clear()
-		await Promise.all(closing)
 	}
 }
 
-/**
- * Creates the per-account websocket transport. Any failure (handshake,
- * timeout, mid-stream error) is surfaced as `fallbackToHttp` so callers replay
- * the request on the HTTP path.
- */
 export const createWebsocketTransport = (
 	options: WebsocketTransportOptions = {},
 ): WebsocketTransport => {
 	const manager = new WebsocketConnectionManager(options)
 	return {
 		fallbackToHttp: true,
-		streamResponse: async (requestBody, identity, accessToken) => {
-			const connection = manager.connectionFor(
-				{
-					accountId: identity.accountId,
-					installationId: identity.installationId,
-					sessionId: identity.sessionId,
-					threadId: identity.threadId,
-				},
-				accessToken,
-			)
-			return connection.streamResponse(requestBody, accessToken)
-		},
-		prewarm: (identity, accessToken) => {
-			manager.prewarm(identity, accessToken)
-		},
+		streamResponse: async (body, identity, token) =>
+			manager
+				.connectionFor(identity, token)
+				.streamResponse(body, token, identity),
+		prewarm: (identity, token) => manager.prewarm(identity, token),
 		close: () => manager.close(),
 	}
 }

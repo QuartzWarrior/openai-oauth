@@ -23,6 +23,20 @@ const result = await generateText({
 });
 ```
 
+Set reasoning effort through provider options for either `generateText` or `streamText`:
+
+```ts
+const result = await generateText({
+	model: openai("gpt-6-astra"),
+	prompt: "Work through this problem carefully.",
+	providerOptions: {
+		openai: { reasoningEffort: "high" },
+	},
+});
+```
+
+Explicit `reasoningEffort` and `reasoningSummary` options are forwarded even when the underlying AI SDK does not yet recognize the model name. Model availability and supported effort levels depend on your upstream account/model. An explicit `forceReasoning: false` opts out of this behavior. The HTTP proxy accepts the equivalent `reasoning_effort` field on `/v1/chat/completions`; no extra server flag is needed.
+
 Generate or edit images with GPT Image 2:
 
 ```ts

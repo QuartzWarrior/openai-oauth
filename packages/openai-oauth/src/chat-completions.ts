@@ -78,11 +78,38 @@ export const handleChatCompletionsRequest = async (
 		})
 		return toErrorResponse("`messages` must be an array.")
 	}
+
+	if (
+		body.response_format !== undefined &&
+		(!isRecord(body.response_format) || body.response_format.type !== "text")
+	) {
+		return toErrorResponse(
+			"`response_format` supports only `text` on this endpoint; use /v1/responses for structured output.",
+		)
+	}
+	if (
+		body.tools !== undefined &&
+		(!Array.isArray(body.tools) ||
+			body.tools.some(
+				(definition) =>
+					!isRecord(definition) ||
+					definition.type !== "function" ||
+					!isRecord(definition.function) ||
+					typeof definition.function.name !== "string" ||
+					!definition.function.name ||
+					(definition.function.strict !== undefined &&
+						typeof definition.function.strict !== "boolean"),
+			))
+	) {
+		return toErrorResponse(
+			"`tools` must contain named function definitions with a boolean `strict` option when provided.",
+		)
+	}
 	const outputLimit = resolveChatOutputLimit(body)
 	if (outputLimit.error !== undefined) {
 		return toErrorResponse(outputLimit.error)
 	}
-
+	request.signal.throwIfAborted()
 	emitRequestLog(logger, {
 		type: "chat_request",
 		requestId,
@@ -91,15 +118,21 @@ export const handleChatCompletionsRequest = async (
 	})
 
 	if (body.stream === true) {
-		return streamChatCompletions(body, provider, {
-			logger,
-			requestId,
-			startedAt,
-		})
+		return streamChatCompletions(
+			body,
+			provider,
+			{
+				logger,
+				requestId,
+				startedAt,
+			},
+			request.signal,
+		)
 	}
 
 	try {
 		const result = await generateText({
+			abortSignal: request.signal,
 			model: provider(body.model ?? "gpt-5.2"),
 			messages: toModelMessages(body.messages),
 			tools: createToolSet(body.tools),

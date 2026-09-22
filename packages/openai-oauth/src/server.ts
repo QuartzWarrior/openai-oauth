@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from "node:crypto"
 import { createServer } from "node:http"
 import type { AddressInfo } from "node:net"
 import {
@@ -16,10 +17,17 @@ import {
 } from "./images.js"
 import { createRequestLogger } from "./logging.js"
 import { createModelResolver } from "./models.js"
+import {
+	handlePoolDiagnosticsRequest,
+	type PoolDiagnosticsSource,
+} from "./pool-diagnostics.js"
 import { handleResponsesRequest } from "./responses.js"
 import {
 	DEFAULT_HOST,
+	DEFAULT_MAX_REQUEST_BODY_BYTES,
 	DEFAULT_PORT,
+	limitRequestBody,
+	RequestBodyTooLargeError,
 	resolveAddress,
 	toErrorResponse,
 	toJsonResponse,
@@ -37,8 +45,16 @@ const handleRoutes = async (
 	client: OpenAIOAuthTransport,
 	resolveModels: () => Promise<string[]>,
 	requestLogger: ReturnType<typeof createRequestLogger>,
+	poolDiagnostics?: PoolDiagnosticsSource,
 ): Promise<Response> => {
 	const url = new URL(request.url)
+	if (poolDiagnostics && url.pathname.startsWith("/pool/")) {
+		const response = await handlePoolDiagnosticsRequest(
+			request,
+			poolDiagnostics,
+		)
+		if (response) return response
+	}
 	if (request.method === "GET" && url.pathname === "/health") {
 		return toJsonResponse({
 			ok: true,
@@ -58,12 +74,8 @@ const handleRoutes = async (
 					owned_by: "codex-oauth",
 				})),
 			})
-		} catch (error) {
-			return toErrorResponse(
-				error instanceof Error ? error.message : "Failed to load models.",
-				502,
-				"upstream_error",
-			)
+		} catch {
+			return toErrorResponse("Failed to load models.", 502, "upstream_error")
 		}
 	}
 
@@ -87,36 +99,130 @@ const handleRoutes = async (
 }
 
 const createOpenAIOAuthRuntime = (settings: OpenAIOAuthServerOptions = {}) => {
-	const auth = openaiCredentials(settings)
+	const {
+		credentials,
+		poolDiagnostics,
+		deferModelDiscovery,
+		accessToken,
+		authorizeRequest,
+		maxRequestBodyBytes = DEFAULT_MAX_REQUEST_BODY_BYTES,
+		...localSettings
+	} = settings
+	if (!Number.isSafeInteger(maxRequestBodyBytes) || maxRequestBodyBytes <= 0) {
+		throw new Error("maxRequestBodyBytes must be a positive integer.")
+	}
+	if (
+		accessToken !== undefined &&
+		(!accessToken.trim() || /\s/.test(accessToken))
+	) {
+		throw new Error(
+			"accessToken must be a nonempty Bearer token without whitespace.",
+		)
+	}
+	const tokenDigest =
+		accessToken === undefined
+			? undefined
+			: createHash("sha256").update(accessToken).digest()
+	const auth = credentials ?? openaiCredentials(localSettings)
 	const sharedSettings = {
-		...settings,
+		...localSettings,
 		auth: () => auth.getSession(),
+		baseURL: localSettings.baseURL ?? auth.baseURL,
+		fetch: localSettings.fetch ?? auth.fetch,
+		headers: localSettings.headers ?? auth.headers,
+		instructions: localSettings.instructions ?? auth.instructions,
+		openAIBaseURL: localSettings.openAIBaseURL ?? auth.openAIBaseURL,
 		responsesState: false as const,
 	}
-	const client = createOpenAIOAuthTransport(sharedSettings)
+	if (
+		auth.transport &&
+		[
+			"baseURL",
+			"fetch",
+			"headers",
+			"instructions",
+			"openAIBaseURL",
+			"codexVersion",
+		].some(
+			(key) => localSettings[key as keyof typeof localSettings] !== undefined,
+		)
+	)
+		throw new Error(
+			"Configure transport overrides on the supplied ready credential transport, not on the server.",
+		)
+	const client = auth.transport ?? createOpenAIOAuthTransport(sharedSettings)
 	const provider = createOpenAIOAuth(client)
-	const resolveModels = createModelResolver(client, settings.models)
-	const requestLogger = createRequestLogger(settings)
+	const resolveModels = createModelResolver(client, localSettings.models)
+	const requestLogger = createRequestLogger(localSettings)
 
 	const handler = async (request: Request): Promise<Response> => {
+		const responseFor = (response: Response) => {
+			if (new URL(request.url).pathname.startsWith("/pool/"))
+				response.headers.set("cache-control", "no-store")
+			return response
+		}
+		let boundedRequest: Request | undefined
 		try {
-			return await handleRoutes(
-				request,
-				provider,
-				client,
-				resolveModels,
-				requestLogger,
+			request.signal.throwIfAborted()
+			const bearer = /^Bearer ([^\s]+)$/i.exec(
+				request.headers.get("authorization") ?? "",
+			)?.[1]
+			const allowedToken =
+				tokenDigest === undefined ||
+				(bearer !== undefined &&
+					timingSafeEqual(
+						tokenDigest,
+						createHash("sha256").update(bearer).digest(),
+					))
+			const authorizationRequest = new Request(request.url, {
+				method: request.method,
+				headers: request.headers,
+				signal: request.signal,
+			})
+			if (
+				!allowedToken ||
+				(authorizeRequest && !(await authorizeRequest(authorizationRequest)))
+			) {
+				void request.body?.cancel().catch(() => undefined)
+				const response = toErrorResponse(
+					"Unauthorized.",
+					401,
+					"authentication_error",
+				)
+				response.headers.set("www-authenticate", "Bearer")
+				return responseFor(response)
+			}
+			request.signal.throwIfAborted()
+			boundedRequest = limitRequestBody(request, maxRequestBodyBytes)
+			return responseFor(
+				await handleRoutes(
+					boundedRequest,
+					provider,
+					client,
+					resolveModels,
+					requestLogger,
+					poolDiagnostics,
+				),
 			)
 		} catch (error) {
-			return toErrorResponse(
-				error instanceof Error ? error.message : "Unexpected server error.",
-				500,
-				"server_error",
+			if (request.signal.aborted)
+				return responseFor(
+					toErrorResponse("Request aborted.", 499, "request_aborted"),
+				)
+			if (error instanceof RequestBodyTooLargeError)
+				return responseFor(toErrorResponse(error.message, 413))
+			if (error instanceof SyntaxError)
+				return responseFor(toErrorResponse("Request body must be valid JSON."))
+			return responseFor(
+				toErrorResponse("Unexpected server error.", 500, "server_error"),
 			)
+		} finally {
+			const body = (boundedRequest ?? request).body
+			if (body && !body.locked) void body.cancel().catch(() => undefined)
 		}
 	}
 
-	return { handler, resolveModels }
+	return { deferModelDiscovery, handler, resolveModels }
 }
 
 export const createOpenAIOAuthFetchHandler = (
@@ -130,22 +236,48 @@ export const startOpenAIOAuthServer = async (
 	const host = settings.host ?? DEFAULT_HOST
 	const port = settings.port ?? DEFAULT_PORT
 	const runtime = createOpenAIOAuthRuntime(settings)
-	const models = await runtime.resolveModels()
+	const models = runtime.deferModelDiscovery
+		? (settings.models ?? [])
+		: await runtime.resolveModels()
 	const handler = runtime.handler
 	const server = createServer(async (req, res) => {
+		const controller = new AbortController()
+		const abort = () =>
+			controller.abort(new DOMException("Client disconnected.", "AbortError"))
+		const onClose = () => {
+			if (!res.writableEnded) abort()
+		}
+		req.once("aborted", abort)
+		res.once("close", onClose)
 		try {
-			const request = await toWebRequest(req, { host, port })
+			const request = await toWebRequest(req, {
+				host,
+				port,
+				signal: controller.signal,
+			})
 			const response = await handler(request)
+			// Do not retain unread upload bytes after an early rejection.
+			if (!req.complete) {
+				response.headers.set("connection", "close")
+				res.shouldKeepAlive = false
+			}
 			await writeWebResponse(res, response)
 		} catch (error) {
-			if (res.headersSent || res.writableEnded) {
+			if (res.headersSent || res.writableEnded || res.destroyed) {
 				res.destroy(error instanceof Error ? error : undefined)
 				return
 			}
-
-			const message =
-				error instanceof Error ? error.message : "Unexpected server error."
-			await writeWebResponse(res, toErrorResponse(message, 500, "server_error"))
+			try {
+				await writeWebResponse(
+					res,
+					toErrorResponse("Unexpected server error.", 500, "server_error"),
+				)
+			} catch {
+				res.destroy()
+			}
+		} finally {
+			req.off("aborted", abort)
+			res.off("close", onClose)
 		}
 	})
 
@@ -162,7 +294,7 @@ export const startOpenAIOAuthServer = async (
 		server,
 		host: address.host,
 		port: address.port,
-		url: `http://${address.host}:${address.port}/v1`,
+		url: `http://${address.host.includes(":") ? `[${address.host}]` : address.host}:${address.port}/v1`,
 		models,
 		close: () =>
 			new Promise<void>((resolve, reject) => {

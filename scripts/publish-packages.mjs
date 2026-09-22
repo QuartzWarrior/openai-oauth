@@ -10,6 +10,7 @@ const requestedArgs = process.argv.slice(2)
 const packageDirs = [
 	"packages/core",
 	"packages/local",
+	"packages/pool",
 	"packages/web",
 	"packages/openai-client",
 	"packages/ai-sdk",

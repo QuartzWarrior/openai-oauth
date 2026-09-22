@@ -135,6 +135,51 @@ describe("openai oauth server", () => {
 		})
 	})
 
+	test("uses an injected credential source and its isolated fetch", async () => {
+		const fetch = vi.fn(async (input: RequestInfo | URL) => {
+			if (String(input) === "https://registry.npmjs.org/@openai/codex/latest") {
+				return Response.json({ version: "0.144.1" })
+			}
+			expect(String(input)).toContain(
+				"/backend-api/codex/models?client_version=",
+			)
+			return Response.json({ models: [{ slug: "gpt-5.4-mini" }] })
+		})
+		const handler = createOpenAIOAuthFetchHandler({
+			credentials: {
+				kind: "openai-oauth",
+				fetch,
+				getSession: async () => ({
+					accessToken: "access-token",
+					accountId: "acct-isolated",
+				}),
+			},
+		})
+
+		const response = await handler(
+			new Request("http://localhost/v1/models", { method: "GET" }),
+		)
+
+		expect(fetch).toHaveBeenCalled()
+		await expect(response.json()).resolves.toEqual({
+			object: "list",
+			data: [
+				{
+					id: "gpt-5.4-mini",
+					object: "model",
+					created: 0,
+					owned_by: "codex-oauth",
+				},
+				{
+					id: "gpt-image-2",
+					object: "model",
+					created: 0,
+					owned_by: "codex-oauth",
+				},
+			],
+		})
+	})
+
 	test("returns an upstream error when codex model discovery fails", async () => {
 		const authFilePath = await createAuthFile()
 		const fetch = vi.fn(
@@ -166,7 +211,7 @@ describe("openai oauth server", () => {
 		expect(response.status).toBe(502)
 		await expect(response.json()).resolves.toEqual({
 			error: {
-				message: "This account does not support codex model discovery.",
+				message: "Failed to load models.",
 				type: "upstream_error",
 			},
 		})
@@ -362,6 +407,116 @@ describe("openai oauth server", () => {
 			recursive: true,
 			force: true,
 		})
+	})
+
+	test.each([
+		false,
+		true,
+	])("forwards explicit chat reasoning effort for newer models (stream=%s)", async (stream) => {
+		const authFilePath = await createAuthFile()
+		const bodies: Record<string, unknown>[] = []
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+		try {
+			const handler = createOpenAIOAuthFetchHandler({
+				authFilePath,
+				codexVersion: "0.144.1",
+				ensureFresh: false,
+				fetch: async (input, init) => {
+					if (String(input).includes("/backend-api/codex/models?")) {
+						return Response.json({
+							models: [
+								{
+									slug: "gpt-6-astra",
+									visibility: "list",
+									default_reasoning_level: "low",
+								},
+							],
+						})
+					}
+					expect(String(input)).toBe(
+						"https://chatgpt.com/backend-api/codex/responses",
+					)
+					bodies.push(JSON.parse(String(init?.body)))
+					const events = [
+						{
+							type: "response.created",
+							response: {
+								id: "resp_effort",
+								model: "gpt-6-astra",
+								created_at: 1735689600,
+							},
+						},
+						{
+							type: "response.output_item.added",
+							output_index: 0,
+							item: { type: "message", id: "msg_effort" },
+						},
+						{
+							type: "response.output_text.delta",
+							item_id: "msg_effort",
+							output_index: 0,
+							content_index: 0,
+							delta: "hello",
+						},
+						{
+							type: "response.output_item.done",
+							output_index: 0,
+							item: { type: "message", id: "msg_effort" },
+						},
+						{
+							type: "response.completed",
+							response: {
+								id: "resp_effort",
+								model: "gpt-6-astra",
+								status: "completed",
+								output: [],
+								usage: { input_tokens: 1, output_tokens: 1 },
+							},
+						},
+					]
+					return new Response(
+						events
+							.map((event) => `data: ${JSON.stringify(event)}\n\n`)
+							.join(""),
+						{
+							headers: { "content-type": "text/event-stream" },
+						},
+					)
+				},
+			})
+			const response = await handler(
+				new Request("http://localhost/v1/chat/completions", {
+					method: "POST",
+					headers: { "content-type": "application/json" },
+					body: JSON.stringify({
+						model: "gpt-6-astra",
+						messages: [{ role: "user", content: "say hello" }],
+						reasoning_effort: "high",
+						stream,
+					}),
+				}),
+			)
+			expect(response.status).toBe(200)
+			if (stream) {
+				const text = await response.text()
+				expect(text).toContain('"content":"hello"')
+				expect(text).toContain("data: [DONE]")
+			} else {
+				expect(await response.json()).toMatchObject({
+					choices: [{ message: { content: "hello" } }],
+				})
+			}
+			expect(bodies).toHaveLength(1)
+			expect(bodies[0]).toMatchObject({
+				model: "gpt-6-astra",
+				reasoning: { effort: "high" },
+			})
+			expect(warn.mock.calls.flat().join(" ")).not.toContain(
+				"reasoningEffort is not supported",
+			)
+		} finally {
+			await fs.rm(path.dirname(authFilePath), { recursive: true, force: true })
+		}
 	})
 
 	test("rejects previous_response_id on the stateless responses endpoint", async () => {

@@ -3,11 +3,10 @@ export const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 /**
  * Mint an RFC 9562 UUIDv7: 48-bit Unix-ms timestamp in the high bits, `0111`
- * version, RFC variant, random tail. Codex's entire ID universe is v7
- * (protocol/src/items.rs, session_id.rs, response_item_id.rs, turn_metadata.rs,
- * ...), so every id this client sends upstream — thread, session, turn — must
- * be time-ordered v7 too; a v4 is regex-valid but generationally inconsistent
- * with every other id the wire ever sees from a real client.
+ * version, RFC variant, random tail. Use only for identifiers whose protocol
+ * calls for v7; installation IDs and deterministic item IDs have different
+ * requirements. Random tails do not guarantee ordering within one millisecond,
+ * and this helper does not compensate for system-clock rollback.
  */
 export const randomUUIDv7 = (): string => {
 	const nowMs = BigInt(Date.now()) & 0xffffffffffffn

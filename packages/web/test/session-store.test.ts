@@ -9,10 +9,39 @@ const transactionDone = (transaction: IDBTransaction) =>
 	})
 
 afterEach(() => {
+	vi.restoreAllMocks()
 	vi.unstubAllGlobals()
 })
 
 describe("browser session store", () => {
+	test("concurrent initializers share one persisted encryption key", async () => {
+		vi.stubGlobal("window", globalThis)
+		const generateKey = crypto.subtle.generateKey.bind(crypto.subtle)
+		let release!: () => void
+		const bothGenerated = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let generated = 0
+		vi.spyOn(crypto.subtle, "generateKey").mockImplementation(
+			async (...args) => {
+				const key = await generateKey(...args)
+				generated += 1
+				if (generated === 2) release()
+				await bothGenerated
+				return key
+			},
+		)
+		// Different session slots share the same key, as independent tabs can.
+		const a = createSessionStore({ dbName: "concurrent-key", sessionKey: "a" })
+		const b = createSessionStore({ dbName: "concurrent-key", sessionKey: "b" })
+		const sessionA = { accessToken: "token-a", accountId: "a" }
+		const sessionB = { accessToken: "token-b", accountId: "b" }
+		await Promise.all([a.set(sessionA), b.set(sessionB)])
+		expect(generated).toBe(2)
+		await expect(a.get()).resolves.toEqual(sessionA)
+		await expect(b.get()).resolves.toEqual(sessionB)
+	})
+
 	test("persists, reads, and clears an encrypted session", async () => {
 		vi.stubGlobal("window", globalThis)
 		const store = createSessionStore({ dbName: "session-store-roundtrip" })

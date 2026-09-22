@@ -52,6 +52,7 @@
 	},
 	"devDependencies": {
 		"@openai-oauth/local": "workspace:*",
+		"@openai-oauth/pool": "workspace:*",
 		"@types/node": "20.17.24",
 		"ai": "6.0.116",
 		"typescript": "5.9.2",

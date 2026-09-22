@@ -463,7 +463,11 @@ describe("createOpenAIPool", () => {
 
 	it("stamps <thread_id>:0 window id in body client_metadata like codex", async () => {
 		stubModelCatalog()
-		const seen: Array<{ windowId: unknown; threadId: unknown; turnId: unknown }> = []
+		const seen: Array<{
+			windowId: unknown
+			threadId: unknown
+			turnId: unknown
+		}> = []
 		const accountFetch = (async (
 			input: RequestInfo | URL,
 			init?: RequestInit,
@@ -505,7 +509,7 @@ describe("createOpenAIPool", () => {
 		await pool.destroy()
 	})
 
-	it("captures x-codex-turn-state from a response and echoes it on the next same-conversation request", async () => {
+	it("echoes turn-state only within explicitly identified turns", async () => {
 		stubModelCatalog()
 		const bodies: Array<Record<string, unknown>> = []
 		const turnStatesSeen: Array<string | null> = []
@@ -541,7 +545,14 @@ describe("createOpenAIPool", () => {
 
 		// Same conversation (identical model+instructions+input) twice: the first
 		// request sends no turn-state; the response's token is echoed on the retry.
-		const init = uniqueRequestInit()
+		const init = {
+			...uniqueRequestInit(),
+			headers: {
+				"content-type": "application/json",
+				"x-pool-conversation-id": "conversation",
+				"x-pool-turn-id": "turn-1",
+			},
+		}
 		const first = await pool.fetch(
 			"https://chatgpt.com/backend-api/codex/responses",
 			init,
@@ -553,7 +564,15 @@ describe("createOpenAIPool", () => {
 		)
 		await second.text()
 
-		expect(turnStatesSeen).toEqual([null, "turn-state-token-1"])
+		const third = await pool.fetch(
+			"https://chatgpt.com/backend-api/codex/responses",
+			{
+				...init,
+				headers: { ...init.headers, "x-pool-turn-id": "turn-2" },
+			},
+		)
+		await third.text()
+		expect(turnStatesSeen).toEqual([null, "turn-state-token-1", null])
 		await pool.destroy()
 	})
 
@@ -653,7 +672,7 @@ describe("createOpenAIPool", () => {
 		await pool.destroy()
 	})
 
-	it("moves to the other account on 429 and skips the cooling one", async () => {
+	it("returns quota errors without replay and skips cooling accounts for new requests", async () => {
 		stubModelCatalog()
 		const responsesCalls = { a: 0, b: 0 }
 
@@ -690,7 +709,7 @@ describe("createOpenAIPool", () => {
 			uniqueRequestInit(),
 		)
 		await first.text()
-		expect(first.status).toBe(200)
+		expect(first.status).toBe(429)
 
 		const stats = pool.stats()
 		const statA = stats.find((entry) => entry.name === "a")
@@ -708,7 +727,7 @@ describe("createOpenAIPool", () => {
 		expect(second.status).toBe(200)
 
 		expect(responsesCalls.a).toBe(1)
-		expect(responsesCalls.b).toBeGreaterThanOrEqual(2)
+		expect(responsesCalls.b).toBe(1)
 		await pool.destroy()
 	})
 
@@ -726,105 +745,50 @@ describe("createOpenAIPool", () => {
 		return response
 	}
 
-	it("migrates a chained conversation off a persistently-failing account, fresh ids, no chain", async () => {
+	it("keeps a changing-input continuation on its owner through quota cooldown", async () => {
 		stubModelCatalog()
-		// Account "a" serves turn 1, then hard-fails (429 rate-limit) thereafter;
-		// "b" stays healthy. Turn 2 references the chain and stays pinned to "a"
-		// (codex back-off on a transient 429). Once a's cool-down is active, the
-		// next request's pre-check migrates the conversation to "b": full input,
-		// no foreign previous_response_id, b's distinct identity.
-		const seen: Array<{
-			which: "a" | "b"
-			prevId: unknown
-			sessionId: string | null
-		}> = []
+		let now = 1000
+		const calls: string[] = []
 		let aCalls = 0
-		const makeFetch = (which: "a" | "b") =>
-			(async (input: RequestInfo | URL, init?: RequestInit) => {
-				if (isModelsUrl(input)) return modelsResponse()
-				if (isResponsesUrl(input)) {
-					const headers = new Headers(init?.headers)
-					const body = JSON.parse(String(init?.body))
-					seen.push({
-						which,
-						prevId: body.previous_response_id,
-						sessionId: headers.get("session-id"),
-					})
-					if (which === "a") {
-						aCalls += 1
-						if (aCalls > 1) {
-							return errorJsonResponse(
-								429,
-								{ error: { type: "tokens", code: "rate_limit_exceeded" } },
-								{ "retry-after": "60" },
-							)
-						}
-						return makeSseResponse("resp-a-1")
-					}
-					return makeSseResponse("resp-b-1")
-				}
-				return okCodexResponse()
-			}) as typeof fetch
-
 		const pool = await createOpenAIPool({
 			codexVersion: TEST_CODEX_VERSION,
-			accounts: [
-				{
-					authFilePath: makeAuthFile({ accountId: "acct-a" }),
-					name: "a",
-					fetch: makeFetch("a"),
-				},
-				{
-					authFilePath: makeAuthFile({ accountId: "acct-b" }),
-					name: "b",
-					fetch: makeFetch("b"),
-				},
-			],
+			now: () => now,
+			accounts: ["a", "b"].map((name) => ({
+				authFilePath: makeAuthFile({ accountId: name }),
+				name,
+				fetch: (async (input: RequestInfo | URL) => {
+					if (isModelsUrl(input)) return modelsResponse()
+					calls.push(name)
+					if (name === "a" && ++aCalls === 2)
+						return errorJsonResponse(429, {}, { "retry-after": "60" })
+					return makeSseResponse(`resp-${name}`)
+				}) as typeof fetch,
+			})),
 		})
-
-		const conversation = (prevId?: string) =>
-			makeRequestInit({
-				input: [
-					{ role: "user", content: [{ type: "input_text", text: "chain" }] },
-				],
-				...(prevId !== undefined ? { previous_response_id: prevId } : {}),
-			})
-
-		// Turn 1 on "a" (fresh conversation); consume fully so the conversation pins.
-		const first = await runTurn(pool, conversation())
-		expect(first.status).toBe(200)
-		expect(seen[0]?.which).toBe("a")
-		const aSession = seen[0]?.sessionId
-
-		// Turn 2 references resp-a-1, pinned to "a", which now 429s — the
-		// conversation takes the local back-off (codex-plausible) and gets 429.
-		const second = await runTurn(pool, conversation("resp-a-1"))
-		expect(second.status).toBe(429)
-
-		// Turn 3: the pre-check sees "a" cooling and "b" fresh, so the conversation
-		// migrates — landing on "b" as a fresh full-input conversation.
-		const third = await runTurn(pool, conversation("resp-a-1"))
-		expect(third.status).toBe(200)
-
-		const migrated = seen.find((entry) => entry.which === "b")
-		// The conversation landed on "b" after a persistently-failing "a": the pool
-		// presented b's distinct per-conversation identity, never a's, so codex
-		// cannot link the switch back to the overloaded account. The dead account's
-		// `previous_response_id` must never cross the account boundary — "b" sees a
-		// fresh, chain-less full-input conversation.
-		expect(migrated).toBeDefined()
-		expect(migrated?.sessionId).not.toBe(aSession)
-		expect(migrated?.sessionId).not.toBeNull()
-		expect(migrated?.prevId).toBeUndefined()
-
-		// Turn 4 follows the migrated conversation (previous_response_id=resp-b-1):
-		// the pool re-pinned to "b" and continues the chain there.
-		const fourth = await runTurn(pool, conversation("resp-b-1"))
-		expect(fourth.status).toBe(200)
-		const bCalls = seen.filter((entry) => entry.which === "b")
-		expect(bCalls.length).toBeGreaterThanOrEqual(2)
+		await runTurn(pool, makeRequestInit())
+		const delta = makeRequestInit({
+			previous_response_id: "resp-a",
+			input: [{ role: "user", content: "next" }],
+		})
+		expect((await runTurn(pool, delta)).status).toBe(429)
+		const controller = new AbortController()
+		const blocked = pool.fetch(
+			"https://chatgpt.com/backend-api/codex/responses",
+			{ ...delta, signal: controller.signal },
+		)
+		const assertion = expect(blocked).rejects.toThrow()
+		await new Promise((resolve) => setTimeout(resolve, 20))
+		expect(calls).toEqual(["a", "a"])
+		controller.abort()
+		await assertion
+		// A different authorized request is free to use B without moving A's chain.
+		await runTurn(pool, uniqueRequestInit())
+		expect(calls).toEqual(["a", "a", "b"])
+		now += 60_001
+		expect((await runTurn(pool, delta)).status).toBe(200)
+		expect(calls).toEqual(["a", "a", "b", "a"])
 		await pool.destroy()
-	}, 15_000)
+	})
 
 	it("queues requests while all accounts cool and dispatches on recovery", async () => {
 		// Real timers: the fake clock races real auth-file I/O, so the scheduled
@@ -870,13 +834,19 @@ describe("createOpenAIPool", () => {
 			],
 		})
 
-		// First pool request: A 429 → pre-retry back-off → B 429 → both cooling.
+		// Separate requests encounter each account's cooldown; no hidden replay.
 		const first = await pool.fetch(
 			"https://chatgpt.com/backend-api/codex/responses",
 			uniqueRequestInit(),
 		)
 		expect(first.status).toBe(429)
 		await first.text()
+		const other = await pool.fetch(
+			"https://chatgpt.com/backend-api/codex/responses",
+			uniqueRequestInit(),
+		)
+		expect(other.status).toBe(429)
+		await other.text()
 		expect(responsesCalls.a).toBe(1)
 		expect(responsesCalls.b).toBe(1)
 		expect(pool.stats().filter((stat) => stat.healthy)).toHaveLength(0)
@@ -1246,6 +1216,47 @@ describe("createOpenAIPool", () => {
 		await pool.destroy()
 	})
 
+	it("refreshes health and quota observations in the background when enabled", async () => {
+		let modelCalls = 0
+		const pool = await createOpenAIPool({
+			codexVersion: TEST_CODEX_VERSION,
+			healthRefreshMs: 20,
+			accounts: [
+				{
+					authFilePath: makeAuthFile({ accountId: "acct-refresh" }),
+					fetch: (async (input: RequestInfo | URL) => {
+						if (!isModelsUrl(input)) return okCodexResponse()
+						modelCalls += 1
+						return new Response(JSON.stringify({ models: [] }), {
+							status: 200,
+							headers: {
+								"content-type": "application/json",
+								"x-codex-primary-used-percent": "37",
+								"x-codex-primary-window-minutes": "300",
+							},
+						})
+					}) as typeof fetch,
+				},
+			],
+		})
+		try {
+			await waitFor(() => modelCalls === 1, "initial health refresh")
+			expect(modelCalls).toBe(1)
+			expect(pool.stats()[0]).toMatchObject({
+				healthy: true,
+				codex: { primaryUsedPercent: 37 },
+				quota: { families: [{ limitId: "codex", primary: { usedPercent: 37 } }] },
+			})
+			await waitFor(() => modelCalls === 2, "scheduled health refresh")
+			expect(modelCalls).toBe(2)
+			await pool.close()
+			await new Promise((resolve) => setTimeout(resolve, 50))
+			expect(modelCalls).toBe(2)
+		} finally {
+			await pool.destroy()
+		}
+	})
+
 	it("serves many hundreds of concurrent requests with balanced spread and isolated identities", async () => {
 		stubModelCatalog()
 		// Three accounts, each with a distinct installation id; the stress asserts
@@ -1264,6 +1275,7 @@ describe("createOpenAIPool", () => {
 		const perAccountCalls = [0, 0, 0]
 		let peakInflight = 0
 		let inflight = 0
+		const releases: Array<() => void> = []
 
 		const makeFetch = (which: number) =>
 			(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -1282,7 +1294,7 @@ describe("createOpenAIPool", () => {
 					})
 					inflight += 1
 					peakInflight = Math.max(peakInflight, inflight)
-					await new Promise((resolve) => setTimeout(resolve, 2))
+					await new Promise<void>((resolve) => releases.push(resolve))
 					inflight -= 1
 					return okCodexResponse()
 				}
@@ -1291,6 +1303,7 @@ describe("createOpenAIPool", () => {
 
 		const pool = await createOpenAIPool({
 			codexVersion: TEST_CODEX_VERSION,
+			maxInflightPerAccount: 200,
 			accounts: Array.from({ length: ACCOUNT_COUNT }, (_, which) => ({
 				authFilePath: makeAuthFile({ accountId: `acct-${which}` }),
 				name: `a${which}`,
@@ -1305,6 +1318,14 @@ describe("createOpenAIPool", () => {
 				uniqueRequestInit(),
 			),
 		)
+		await waitFor(
+			() => releases.length === REQUEST_COUNT,
+			"all 400 mock requests concurrently active",
+		)
+		expect(pool.stats().reduce((sum, entry) => sum + entry.inflight, 0)).toBe(
+			REQUEST_COUNT,
+		)
+		for (const release of releases) release()
 		const responses = await Promise.all(requests)
 		await Promise.all(responses.map((response) => response.text()))
 
@@ -1315,7 +1336,7 @@ describe("createOpenAIPool", () => {
 
 		// Real concurrency: the pool genuinely served many requests in flight at
 		// once (not a serial drain).
-		expect(peakInflight).toBeGreaterThan(1)
+		expect(peakInflight).toBe(REQUEST_COUNT)
 
 		// Load balanced: each account carried a healthy share. With weighted
 		// least-busy across 3 accounts the observed spread should be nowhere near

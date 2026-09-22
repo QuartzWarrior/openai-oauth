@@ -3,7 +3,7 @@ import {
 	logout as clearLogin,
 	completeLogin,
 	createSessionStore,
-	refreshSession,
+	refreshStoredSession,
 	type StartLoginOptions,
 	startLogin,
 } from "@openai-oauth/web"
@@ -111,6 +111,33 @@ export const useSignInWithChatGPT = (
 	const defaultStore = useMemo(() => createSessionStore(), [])
 	const sessionStore = providedSessionStore ?? defaultStore
 	const [state, setState] = useState<SignInWithChatGPTState>(checkingState)
+	const lifecycle = useRef({ generation: 0, mounted: false })
+	const activeRequests = useRef(new Set<AbortController>())
+	const refreshRequest = useRef<{
+		generation: number
+		promise: Promise<OpenAIOAuthSession | null>
+	} | null>(null)
+	const invalidate = useCallback(() => {
+		lifecycle.current.generation += 1
+		for (const controller of activeRequests.current) controller.abort()
+		activeRequests.current.clear()
+		refreshRequest.current = null
+		return lifecycle.current.generation
+	}, [])
+	const isCurrent = useCallback(
+		(generation: number) =>
+			lifecycle.current.mounted && lifecycle.current.generation === generation,
+		[],
+	)
+	// biome-ignore lint/correctness/useExhaustiveDependencies: a replacement store invalidates operations from the old owner.
+	useEffect(() => {
+		lifecycle.current.mounted = true
+		invalidate()
+		return () => {
+			lifecycle.current.mounted = false
+			invalidate()
+		}
+	}, [sessionStore, invalidate])
 
 	const signedInState = useCallback(
 		(session: OpenAIOAuthSession): SignInWithChatGPTState => ({
@@ -143,29 +170,56 @@ export const useSignInWithChatGPT = (
 	)
 
 	const loadStoredSession = useCallback(async () => {
-		const session = await sessionStore.get()
-		if (!session) {
-			setLoginState(signedOutState)
-			return
+		const generation = invalidate()
+		try {
+			const session = await sessionStore.get()
+			if (!isCurrent(generation)) return
+			if (!session) {
+				setLoginState(signedOutState)
+				return
+			}
+			const next = signedInState(session)
+			setLoginState(next)
+			onSuccessRef.current?.(session)
+		} catch (error) {
+			if (isCurrent(generation)) fail(error)
 		}
-		const next = signedInState(session)
-		setLoginState(next)
-		onSuccessRef.current?.(session)
-	}, [sessionStore, onSuccessRef, setLoginState, signedInState])
+	}, [
+		sessionStore,
+		onSuccessRef,
+		setLoginState,
+		signedInState,
+		invalidate,
+		isCurrent,
+		fail,
+	])
 
 	const completeCallback = useCallback(async (): Promise<boolean> => {
 		if (!isBrowser()) {
 			return false
 		}
 
-		const session = await completeLogin({
-			clientId,
-			fetch: fetchImpl,
-			issuer,
-			now,
-			sessionStore,
-			tokenUrl,
-		})
+		const generation = lifecycle.current.generation
+		const controller = new AbortController()
+		activeRequests.current.add(controller)
+		let session: OpenAIOAuthSession | null
+		try {
+			session = await completeLogin({
+				clientId,
+				fetch: fetchImpl,
+				issuer,
+				now,
+				sessionStore,
+				tokenUrl,
+				signal: controller.signal,
+			})
+		} catch (error) {
+			if (!isCurrent(generation)) return true
+			throw error
+		} finally {
+			activeRequests.current.delete(controller)
+		}
+		if (!isCurrent(generation)) return true
 		if (!session) {
 			return false
 		}
@@ -185,6 +239,7 @@ export const useSignInWithChatGPT = (
 		onSuccessRef,
 		setLoginState,
 		signedInState,
+		isCurrent,
 	])
 
 	useEffect(() => {
@@ -248,6 +303,7 @@ export const useSignInWithChatGPT = (
 			return
 		}
 
+		const generation = invalidate()
 		try {
 			if (state.status !== "needs-extension") {
 				setLoginState({
@@ -258,6 +314,7 @@ export const useSignInWithChatGPT = (
 			}
 
 			const result = await startLogin({
+				sessionStore,
 				callbackPath,
 				clientId,
 				codeVerifier,
@@ -270,6 +327,7 @@ export const useSignInWithChatGPT = (
 				simplifiedFlow,
 				state: configuredState,
 			})
+			if (!isCurrent(generation)) return
 			if (result.status === "needs-extension") {
 				setLoginState(needsExtensionState(result.installUrl))
 				return
@@ -281,6 +339,7 @@ export const useSignInWithChatGPT = (
 				error: null,
 			})
 		} catch (error) {
+			if (!isCurrent(generation)) return
 			fail(
 				error,
 				error instanceof Error &&
@@ -301,48 +360,58 @@ export const useSignInWithChatGPT = (
 		openMode,
 		redirectUri,
 		scope,
+		sessionStore,
 		setLoginState,
 		simplifiedFlow,
 		state.status,
+		invalidate,
+		isCurrent,
 	])
 
 	const logout = useCallback(async () => {
+		const generation = invalidate()
 		await clearLogin({ sessionStore })
-		setLoginState(signedOutState)
-	}, [sessionStore, setLoginState])
+		if (isCurrent(generation)) setLoginState(signedOutState)
+	}, [sessionStore, setLoginState, invalidate, isCurrent])
 
-	const refresh = useCallback(async () => {
-		try {
-			const session = state.session ?? (await sessionStore.get())
-			if (!session?.refreshToken) {
-				fail(new Error("No refresh token is available."), "not-authenticated")
-				return null
-			}
-			const refreshed = await refreshSession(
-				{
-					refreshToken: session.refreshToken,
-				},
-				{
+	const refresh = useCallback((): Promise<OpenAIOAuthSession | null> => {
+		const generation = lifecycle.current.generation
+		if (refreshRequest.current?.generation === generation) {
+			return refreshRequest.current.promise
+		}
+		const controller = new AbortController()
+		activeRequests.current.add(controller)
+		const promise = (async () => {
+			try {
+				// Read the authoritative store, not a possibly stale rendered session.
+				const nextSession = await refreshStoredSession({
+					sessionStore,
 					clientId,
 					fetch: fetchImpl,
 					issuer,
 					now,
 					tokenUrl,
-				},
-			)
-			const nextSession =
-				session.isFedRamp && !refreshed.isFedRamp
-					? { ...refreshed, isFedRamp: true }
-					: refreshed
-			await sessionStore.set(nextSession)
-			const next = signedInState(nextSession)
-			setLoginState(next)
-			onSuccessRef.current?.(nextSession)
-			return nextSession
-		} catch (error) {
-			fail(error)
-			return null
-		}
+					signal: controller.signal,
+				})
+				if (!isCurrent(generation)) return null
+				if (!nextSession) {
+					setLoginState(signedOutState)
+					return null
+				}
+				setLoginState(signedInState(nextSession))
+				onSuccessRef.current?.(nextSession)
+				return nextSession
+			} catch (error) {
+				if (isCurrent(generation)) fail(error)
+				return null
+			} finally {
+				activeRequests.current.delete(controller)
+				if (refreshRequest.current?.generation === generation)
+					refreshRequest.current = null
+			}
+		})()
+		refreshRequest.current = { generation, promise }
+		return promise
 	}, [
 		clientId,
 		fail,
@@ -353,14 +422,11 @@ export const useSignInWithChatGPT = (
 		sessionStore,
 		setLoginState,
 		signedInState,
-		state.session,
 		tokenUrl,
+		isCurrent,
 	])
 
-	const reset = useCallback(async () => {
-		await clearLogin({ sessionStore })
-		setLoginState(signedOutState)
-	}, [sessionStore, setLoginState])
+	const reset = logout
 
 	return {
 		...state,

@@ -377,7 +377,7 @@ describe("@openai-oauth/web", () => {
 		const accessToken = createToken("acct_refreshed")
 		const stored = {
 			accessToken: createToken("acct_old"),
-			accountId: "acct_old",
+			accountId: "acct_refreshed",
 			isFedRamp: true,
 			refreshToken: "refresh-token",
 			expiresAt: "2026-01-01T00:01:00.000Z",

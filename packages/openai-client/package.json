@@ -43,6 +43,8 @@
 		"@openai-oauth/core": "workspace:*"
 	},
 	"devDependencies": {
+		"@openai-oauth/pool": "workspace:*",
+		"@types/node": "20.17.24",
 		"openai": "6.46.0",
 		"typescript": "5.9.2",
 		"vitest": "4.1.10"

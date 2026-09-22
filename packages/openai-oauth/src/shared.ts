@@ -135,14 +135,80 @@ export const copyUpstreamResponse = (response: Response): Response => {
 	})
 }
 
-const readNodeBody = async (request: IncomingMessage): Promise<Uint8Array> => {
-	const chunks: Buffer[] = []
+export const DEFAULT_MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
 
-	for await (const chunk of request) {
-		chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+export class RequestBodyTooLargeError extends Error {
+	constructor() {
+		super("Request body exceeds the configured size limit.")
+		this.name = "RequestBodyTooLargeError"
 	}
+}
 
-	return Buffer.concat(chunks)
+export const limitRequestBody = (request: Request, limit: number): Request => {
+	const length = request.headers.get("content-length")
+	if (length !== null && Number(length) > limit) {
+		void request.body?.cancel().catch(() => undefined)
+		throw new RequestBodyTooLargeError()
+	}
+	if (request.body === null) return request
+
+	const reader = request.body.getReader()
+	let size = 0
+	let settled = false
+	let controller: ReadableStreamDefaultController<Uint8Array>
+	const cancelSource = (reason?: unknown) => {
+		void reader
+			.cancel(reason)
+			.catch(() => undefined)
+			.finally(() => reader.releaseLock())
+	}
+	const cleanup = () => request.signal.removeEventListener("abort", abort)
+	const abort = () => {
+		if (settled) return
+		settled = true
+		cleanup()
+		controller.error(request.signal.reason)
+		cancelSource(request.signal.reason)
+	}
+	const body = new ReadableStream<Uint8Array>(
+		{
+			start(value) {
+				controller = value
+				request.signal.addEventListener("abort", abort, { once: true })
+				if (request.signal.aborted) abort()
+			},
+			async pull() {
+				try {
+					const { done, value } = await reader.read()
+					if (settled) return
+					if (done) {
+						settled = true
+						cleanup()
+						controller.close()
+						reader.releaseLock()
+						return
+					}
+					size += value.byteLength
+					if (size > limit) throw new RequestBodyTooLargeError()
+					controller.enqueue(value)
+				} catch (error) {
+					if (settled) return
+					settled = true
+					cleanup()
+					controller.error(error)
+					cancelSource(error)
+				}
+			},
+			cancel(reason) {
+				if (settled) return
+				settled = true
+				cleanup()
+				cancelSource(reason)
+			},
+		},
+		{ highWaterMark: 0 },
+	)
+	return new Request(request, { body, duplex: "half" } as RequestInit)
 }
 
 const toHeaders = (headers: IncomingHttpHeaders): Headers => {
@@ -166,21 +232,40 @@ const toHeaders = (headers: IncomingHttpHeaders): Headers => {
 
 export const toWebRequest = async (
 	request: IncomingMessage,
-	options: { host: string; port: number },
+	options: { host: string; port: number; signal?: AbortSignal },
 ): Promise<Request> => {
-	const url = `http://${options.host}:${options.port}${request.url ?? "/"}`
+	const host = options.host.includes(":") ? `[${options.host}]` : options.host
+	const url = `http://${host}:${options.port}${request.url ?? "/"}`
+	const iterator = request.iterator({ destroyOnReturn: false })
 	const body =
 		request.method === "GET" || request.method === "HEAD"
 			? undefined
-			: await readNodeBody(request)
+			: new ReadableStream<Uint8Array>(
+					{
+						async pull(controller) {
+							try {
+								const { done, value } = await iterator.next()
+								if (done) controller.close()
+								else
+									controller.enqueue(
+										Buffer.isBuffer(value) ? value : Buffer.from(value),
+									)
+							} catch (error) {
+								controller.error(error)
+							}
+						},
+						async cancel() {
+							await iterator.return?.()
+						},
+					},
+					{ highWaterMark: 0 },
+				)
 
 	return new Request(url, {
 		method: request.method,
 		headers: toHeaders(request.headers),
-		body:
-			body == null || body.byteLength === 0
-				? undefined
-				: new Blob([Buffer.from(body)]),
+		body,
+		signal: options.signal,
 		duplex: "half",
 	} as RequestInit)
 }
@@ -200,20 +285,53 @@ export const writeWebResponse = async (
 	}
 
 	const reader = webResponse.body.getReader()
-	try {
-		while (true) {
-			const { done, value } = await reader.read()
-			if (done) {
-				break
+	let disconnected = response.destroyed
+	const onClose = () => {
+		disconnected = true
+		void reader
+			.cancel(new DOMException("Client disconnected.", "AbortError"))
+			.catch(() => undefined)
+	}
+	response.once("close", onClose)
+	if (disconnected) onClose()
+	const waitForDrain = () =>
+		new Promise<void>((resolve, reject) => {
+			const cleanup = () => {
+				response.off("drain", drain)
+				response.off("close", close)
+				response.off("error", error)
 			}
-
-			response.write(Buffer.from(value))
+			const drain = () => {
+				cleanup()
+				resolve()
+			}
+			const close = () => {
+				cleanup()
+				reject(new DOMException("Client disconnected.", "AbortError"))
+			}
+			const error = (reason: Error) => {
+				cleanup()
+				reject(reason)
+			}
+			response.once("drain", drain)
+			response.once("close", close)
+			response.once("error", error)
+			if (response.destroyed) close()
+		})
+	try {
+		while (!disconnected) {
+			const { done, value } = await reader.read()
+			if (done || disconnected) break
+			if (!response.write(Buffer.from(value))) await waitForDrain()
 		}
+		if (!disconnected) response.end()
+	} catch (error) {
+		await reader.cancel(error).catch(() => undefined)
+		throw error
 	} finally {
+		response.off("close", onClose)
 		reader.releaseLock()
 	}
-
-	response.end()
 }
 
 export const resolveAddress = (

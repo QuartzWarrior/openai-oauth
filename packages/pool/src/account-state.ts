@@ -4,10 +4,14 @@ const isRecord = (value: unknown): value is JsonRecord =>
 	typeof value === "object" && value !== null && !Array.isArray(value)
 
 export type CodexRateSnapshot = {
+	observedAt?: number
 	primaryUsedPercent?: number
 	secondaryUsedPercent?: number
 	primaryWindowMinutes?: number
 	secondaryWindowMinutes?: number
+	/** Unix epoch milliseconds, not window duration. */
+	primaryResetAt?: number
+	secondaryResetAt?: number
 	planType?: string
 }
 
@@ -38,7 +42,7 @@ const parsePositiveNumber = (value: string | null): number | undefined => {
 	if (value == null) {
 		return undefined
 	}
-	const parsed = Number.parseFloat(value)
+	const parsed = value.trim() === "" ? Number.NaN : Number(value)
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined
 }
 
@@ -49,7 +53,16 @@ const parsePositiveNumber = (value: string | null): number | undefined => {
  */
 export const parseCodexRateHeaders = (
 	headers: Headers,
+	observedAt?: number,
 ): CodexRateSnapshot | undefined => {
+	const resetAt = (name: string): number | undefined => {
+		const value = headers.get(name)
+		if (value == null || !/^\d+$/.test(value)) return undefined
+		const seconds = Number(value)
+		return Number.isSafeInteger(seconds) && Number.isSafeInteger(seconds * 1000)
+			? seconds * 1000
+			: undefined
+	}
 	const snapshot: CodexRateSnapshot = {
 		primaryUsedPercent: parsePositiveNumber(
 			headers.get("x-codex-primary-used-percent"),
@@ -72,14 +85,26 @@ export const parseCodexRateHeaders = (
 	) {
 		return undefined
 	}
+	const primaryResetAt = resetAt("x-codex-primary-reset-at")
+	const secondaryResetAt = resetAt("x-codex-secondary-reset-at")
+	if (primaryResetAt !== undefined) snapshot.primaryResetAt = primaryResetAt
+	if (secondaryResetAt !== undefined)
+		snapshot.secondaryResetAt = secondaryResetAt
+	if (observedAt !== undefined) snapshot.observedAt = observedAt
 	return snapshot
 }
 
 /** Higher = more saturated. Used only as a tie-breaker after inflight. */
 export const rateSnapshotUtilization = (
 	snapshot: CodexRateSnapshot | undefined,
+	now?: number,
 ): number => {
-	if (!snapshot) {
+	if (
+		!snapshot ||
+		(now !== undefined &&
+			snapshot.observedAt !== undefined &&
+			now - snapshot.observedAt > 5 * 60_000)
+	) {
 		return 0
 	}
 	return Math.max(
@@ -99,9 +124,11 @@ const parseRetryAfterMs = (
 	if (!value) {
 		return undefined
 	}
-	const seconds = Number.parseFloat(value)
-	if (Number.isFinite(seconds)) {
-		return Math.max(0, Math.ceil(seconds * 1000))
+	const seconds = Number(value)
+	if (/^\d+(?:\.\d+)?$/.test(value.trim()) && Number.isFinite(seconds)) {
+		return Number.isSafeInteger(Math.ceil(seconds * 1000))
+			? Math.max(0, Math.ceil(seconds * 1000))
+			: undefined
 	}
 	const date = Date.parse(value)
 	if (!Number.isNaN(date)) {
@@ -112,7 +139,7 @@ const parseRetryAfterMs = (
 
 const extractErrorFields = (
 	body: string | undefined,
-): { code?: string; type?: string } => {
+): { code?: string; type?: string; resetAt?: number } => {
 	if (!body) {
 		return {}
 	}
@@ -124,7 +151,15 @@ const extractErrorFields = (
 		const error = isRecord(parsed.error) ? parsed.error : parsed
 		const code = typeof error.code === "string" ? error.code : undefined
 		const type = typeof error.type === "string" ? error.type : undefined
-		return { code, type }
+		const seconds = error.resets_at
+		const resetAt =
+			typeof seconds === "number" &&
+			Number.isSafeInteger(seconds) &&
+			seconds >= 0 &&
+			Number.isSafeInteger(seconds * 1000)
+				? seconds * 1000
+				: undefined
+		return { code, type, resetAt }
 	} catch {
 		return {}
 	}
@@ -153,14 +188,46 @@ export const computeUnavailability = (input: {
 		return undefined
 	}
 
+	const { code, type, resetAt } = extractErrorFields(input.bodyText)
 	const retryAfterMs = parseRetryAfterMs(input.headers, now)
 	const backoffMs = Math.min(
 		MAX_BACKOFF_MS,
 		BASE_BACKOFF_MS * 2 ** Math.min(consecutiveFailures, 4),
 	)
-	const unavailableMs = retryAfterMs ?? backoffMs
+	// reset-at is explicitly Unix seconds in the upstream rate-limit protocol.
+	// Only a saturated window with a future reset can lengthen its cooldown.
+	const active = input.headers?.get("x-codex-active-limit")
+	const activeHeaders = input.headers ? new Headers(input.headers) : undefined
+	if (active && /^[a-z0-9_-]{1,64}$/i.test(active) && activeHeaders) {
+		for (const window of ["primary", "secondary"])
+			for (const field of ["used-percent", "reset-at", "window-minutes"]) {
+				const value = activeHeaders.get(`x-codex-${active}-${window}-${field}`)
+				if (value !== null)
+					activeHeaders.set(`x-codex-${window}-${field}`, value)
+			}
+	}
+	const snapshot = activeHeaders
+		? parseCodexRateHeaders(activeHeaders, now)
+		: undefined
+	const resets = [
+		(snapshot?.primaryUsedPercent ?? 0) >= 100
+			? snapshot?.primaryResetAt
+			: undefined,
+		(snapshot?.secondaryUsedPercent ?? 0) >= 100
+			? snapshot?.secondaryResetAt
+			: undefined,
+	].filter((value): value is number => value !== undefined && value > now)
+	const resetDelay = resets.length > 0 ? Math.max(...resets) - now : undefined
+	const unavailableMs = Math.max(
+		retryAfterMs ?? backoffMs,
+		isRateLimit
+			? Math.max(
+					resetDelay ?? 0,
+					resetAt !== undefined ? Math.max(0, resetAt - now) : 0,
+				)
+			: 0,
+	)
 
-	const { code, type } = extractErrorFields(input.bodyText)
 	const explicitCode =
 		(code && RETRYABLE_UNAVAILABILITY_CODES.has(code)) ||
 		(type && RETRYABLE_UNAVAILABILITY_TYPES.has(type))

@@ -129,7 +129,11 @@ State statuses:
 "checking" | "signed-out" | "starting" | "needs-extension" | "redirecting" | "signed-in" | "error"
 ```
 
-The default browser session store persists encrypted sessions in IndexedDB. Apps can provide their own store:
+The default browser session store persists encrypted sessions in IndexedDB. The hook coalesces concurrent refresh calls and ignores obsolete results after logout, account/store replacement, or unmount. The built-in store combines local generation checks with atomic IndexedDB snapshot comparisons; refresh network calls are coalesced only within one JavaScript realm/store namespace, not across tabs. Custom stores must provide their own coordination for external concurrent writers. See the [browser session guarantees](../web/README.md#browser-session).
+
+The hook also shares duplicate callback exchanges through the browser helpers when consumers use the same store namespace, and forwards that store into explicit login startup. Routine refresh commits do not override the user's pending account choice. Subscriber cancellation remains independent; this does not imply cross-tab code-exchange or refresh single-flight.
+
+Apps can provide their own store:
 
 ```ts
 import { createSessionStore } from "@openai-oauth/react";

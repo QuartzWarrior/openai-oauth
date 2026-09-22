@@ -14,8 +14,12 @@
 	"scripts": {
 		"build": "turbo run build",
 		"dev": "turbo run dev --parallel",
+		"pool:serve": "node scripts/run-pooled-proxy.mjs",
+		"cli:local": "node packages/openai-oauth/dist/cli.js",
 		"typecheck": "turbo run typecheck",
-		"test": "turbo run test",
+		"test": "turbo run test && bun run test:scripts",
+		"test:scripts": "node --test scripts/test-*.mjs",
+		"test:built": "node --test scripts/conformance-built.mjs",
 		"check:browser": "bun scripts/check-browser-bundles.mjs && bun run turbo run build --filter=@openai-oauth/firefox-add-on && bun run --cwd apps/firefox-add-on lint:add-on",
 		"check:release": "bun scripts/check-release.mjs",
 		"format-and-lint": "biome check .",
