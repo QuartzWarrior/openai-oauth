@@ -5,6 +5,7 @@ import {
 	type LanguageModelV3Content,
 	type LanguageModelV3FinishReason,
 	type LanguageModelV3ResponseMetadata,
+	type LanguageModelV3StreamPart,
 	type LanguageModelV3Usage,
 	NoSuchModelError,
 	type ProviderV3,
@@ -16,6 +17,7 @@ import {
 	createOpenAIOAuthTransport,
 	type OpenAIOAuth,
 	type OpenAIOAuthTransport,
+	parseInferenceError,
 } from "@openai-oauth/core"
 import packageMetadata from "../package.json" with { type: "json" }
 import { enforceOutputTokenLimit } from "./output-limit.js"
@@ -59,6 +61,40 @@ const mergeProviderMetadata = (
 	return merged
 }
 
+type StreamResult = Awaited<ReturnType<LanguageModelV3["doStream"]>>
+
+const isFailedResponseChunk = (value: unknown) =>
+	typeof value === "object" &&
+	value !== null &&
+	(value as { type?: unknown }).type === "response.failed"
+
+// The SDK has no case for `response.failed`: it drops the event and finishes
+// the stream as an empty success. Surface it as a classified error instead.
+const surfaceFailedResponses = (
+	result: StreamResult,
+	includeRawChunks: boolean | undefined,
+): StreamResult => ({
+	...result,
+	stream: result.stream.pipeThrough(
+		new TransformStream<LanguageModelV3StreamPart, LanguageModelV3StreamPart>({
+			transform(part, controller) {
+				if (part.type !== "raw") {
+					controller.enqueue(part)
+					return
+				}
+				if (includeRawChunks) controller.enqueue(part)
+				if (isFailedResponseChunk(part.rawValue))
+					controller.enqueue({
+						type: "error",
+						error: parseInferenceError(part.rawValue, {
+							responseStarted: true,
+						}),
+					})
+			},
+		}),
+	),
+})
+
 class CodexResponsesLanguageModel implements LanguageModelV3 {
 	readonly specificationVersion = "v3" as const
 	readonly provider: string
@@ -93,9 +129,14 @@ class CodexResponsesLanguageModel implements LanguageModelV3 {
 				},
 			}
 		}
+		const { includeRawChunks } = options
+		options = { ...options, includeRawChunks: true }
 		const maxOutputTokens = options.maxOutputTokens
 		if (maxOutputTokens === undefined) {
-			return this.model.doStream(options)
+			return surfaceFailedResponses(
+				await this.model.doStream(options),
+				includeRawChunks,
+			)
 		}
 
 		const abortController = new AbortController()
@@ -109,10 +150,14 @@ class CodexResponsesLanguageModel implements LanguageModelV3 {
 			maxOutputTokens: undefined,
 			abortSignal: abortController.signal,
 		})
-		return enforceOutputTokenLimit(result, maxOutputTokens, () => {
-			options.abortSignal?.removeEventListener("abort", abort)
-			abortController.abort("max_completion_tokens reached")
-		})
+		return enforceOutputTokenLimit(
+			surfaceFailedResponses(result, includeRawChunks),
+			maxOutputTokens,
+			() => {
+				options.abortSignal?.removeEventListener("abort", abort)
+				abortController.abort("max_completion_tokens reached")
+			},
+		)
 	}
 
 	async doGenerate(

@@ -131,6 +131,7 @@ export const DEFAULT_OPENAI_OAUTH_SCOPE =
 	"openid profile email offline_access api.connectors.read api.connectors.invoke"
 const DEFAULT_CODEX_INSTRUCTIONS = ""
 const RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
+const ROUTING_HINT_HEADER = "x-codex-routing-hint"
 
 export type FetchFunction = typeof fetch
 
@@ -1019,6 +1020,16 @@ const prepareResponsesRequestBody = async (
 		if (modelInfo?.useResponsesLite) {
 			headers.set(RESPONSES_LITE_HEADER, "true")
 		}
+		// Codex stamps `model=<slug>[;tier=<tier>]` on every ChatGPT-backend
+		// /responses request (core/src/client.rs build_routing_hint_header).
+		if (typeof normalized.model === "string") {
+			headers.set(
+				ROUTING_HINT_HEADER,
+				typeof normalized.service_tier === "string"
+					? `model=${normalized.model};tier=${normalized.service_tier}`
+					: `model=${normalized.model}`,
+			)
+		}
 
 		// Codex ties prompt-cache affinity to the session id twice: the
 		// `session-id` header and an identical `prompt_cache_key` in the body
@@ -1063,8 +1074,10 @@ const prepareResponsesRequestBody = async (
 				settings.headers?.["x-codex-installation-id"] ??
 				settings.headers?.installation_id
 			const metadata: Record<string, string> = {}
-			if (sessionId !== null) {
-				metadata.session_id = sessionId
+			// Read back from headers so a session id minted above is included too.
+			const effectiveSessionId = headers.get("session-id")
+			if (effectiveSessionId !== null) {
+				metadata.session_id = effectiveSessionId
 			}
 			const threadId = headers.get("thread-id")
 			if (threadId !== null) {
@@ -1277,6 +1290,7 @@ const applyAuthHeaders = (
 	headers.delete("chatgpt-account-id")
 	headers.delete("openai-beta")
 	headers.delete(RESPONSES_LITE_HEADER)
+	headers.delete(ROUTING_HINT_HEADER)
 	headers.delete("x-openai-fedramp")
 	headers.set("Authorization", `Bearer ${auth.accessToken}`)
 	headers.set("chatgpt-account-id", auth.accountId)

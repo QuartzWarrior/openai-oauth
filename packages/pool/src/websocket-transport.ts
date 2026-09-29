@@ -7,6 +7,7 @@ import {
 	ResponseSseCollector,
 	resolveCodexClientVersion,
 } from "@openai-oauth/core"
+import type { ChatGptCookieJar } from "./cookie-jar.js"
 
 const RESPONSES_WEBSOCKETS_BETA = "responses_websockets=2026-02-06"
 const WS_CONNECT_TIMEOUT_MS = 10_000
@@ -40,6 +41,8 @@ export type WebsocketTransportOptions = {
 	connectTimeoutMs?: number
 	streamIdleTimeoutMs?: number
 	requestTimeoutMs?: number
+	/** Account-owned ChatGPT infrastructure cookies shared with HTTP. */
+	cookies?: ChatGptCookieJar
 	/** Test hook: bypass the lazy undici import. */
 	webSocketFactory?: WebSocketFactory
 }
@@ -54,6 +57,8 @@ export type WebsocketConnectionIdentity = {
 	threadId?: string
 	/** codex "<thread_id>:<window_number>" window id, sent on the upgrade. */
 	windowId?: string
+	/** `model=<slug>[;tier=<tier>]`, sent on the upgrade like codex's handshake. */
+	routingHint?: string
 }
 
 export type WebsocketIdentity = {
@@ -82,6 +87,8 @@ export type WebsocketIdentity = {
 	 */
 	turnId?: string
 	responsesLite?: boolean
+	/** `model=<slug>[;tier=<tier>]`, sent on the upgrade like codex's handshake. */
+	routingHint?: string
 }
 
 export type WebsocketTransport = {
@@ -107,17 +114,86 @@ type UndiciWebSocket = {
 	): void
 }
 
+type UndiciDispatchHandler = Record<string, unknown>
+type UndiciDispatch = (
+	options: unknown,
+	handler: UndiciDispatchHandler,
+) => boolean
+type UndiciDispatcher = {
+	compose(
+		interceptor: (dispatch: UndiciDispatch) => UndiciDispatch,
+	): UndiciDispatcher
+}
+
 type UndiciModule = {
 	WebSocket: new (
 		url: string,
-		options?: { headers?: Record<string | symbol, string> },
+		options?: {
+			headers?: Record<string | symbol, string>
+			dispatcher?: UndiciDispatcher
+		},
 	) => UndiciWebSocket
+	getGlobalDispatcher(): UndiciDispatcher
 }
+
+/** Receives Set-Cookie values from successful and rejected upgrades. */
+type HandshakeCookieObserver = (setCookies: string[]) => void
 
 type WebSocketFactory = (
 	url: string,
 	headers: Record<string, string>,
+	onSetCookies?: HandshakeCookieObserver,
 ) => Promise<UndiciWebSocket> | UndiciWebSocket
+
+const setCookieValues = (headers: unknown): string[] => {
+	// Undici's handler API passes a header object; the legacy API raw pairs.
+	if (Array.isArray(headers)) {
+		const values: string[] = []
+		for (let index = 0; index + 1 < headers.length; index += 2)
+			if (String(headers[index]).toLowerCase() === "set-cookie")
+				values.push(String(headers[index + 1]))
+		return values
+	}
+	if (!isRecord(headers)) return []
+	const value = headers["set-cookie"]
+	return Array.isArray(value)
+		? value.map(String)
+		: typeof value === "string"
+			? [value]
+			: []
+}
+
+/**
+ * Undici's WebSocket hides handshake response headers, so observe them at the
+ * dispatcher like codex's connector does (websocket-client lib.rs: store cookies
+ * from both successful and rejected upgrades).
+ */
+export const observeHandshakeCookies =
+	(observe: HandshakeCookieObserver) =>
+	(dispatch: UndiciDispatch): UndiciDispatch =>
+	(options, handler) =>
+		dispatch(
+			options,
+			new Proxy(handler, {
+				get(target, property, receiver) {
+					const value = Reflect.get(target, property, receiver)
+					if (typeof value !== "function") return value
+					const index =
+						property === "onRequestUpgrade" || property === "onResponseStart"
+							? 2
+							: property === "onUpgrade" || property === "onHeaders"
+								? 1
+								: -1
+					return (...args: unknown[]) => {
+						if (index >= 0) {
+							const cookies = setCookieValues(args[index])
+							if (cookies.length > 0) observe(cookies)
+						}
+						return value.apply(target, args)
+					}
+				},
+			}),
+		)
 
 let undiciModulePromise: Promise<UndiciModule | undefined> | undefined
 
@@ -164,11 +240,21 @@ export const buildWebsocketUpgradeHeaders = (
 	// account-routing overrides from additional headers.
 	const result = { ...headers, ...extraHeaders }
 	for (const name of Object.keys(result)) {
-		if (["chatgpt-account-id", "x-openai-fedramp"].includes(name.toLowerCase()))
+		if (
+			[
+				"chatgpt-account-id",
+				"x-openai-fedramp",
+				"x-codex-routing-hint",
+			].includes(name.toLowerCase())
+		)
 			delete result[name]
 	}
 	result["chatgpt-account-id"] = identity.accountId
 	if (identity.isFedRamp) result["x-openai-fedramp"] = "true"
+	// Codex puts the routing hint on the handshake (client.rs build_websocket_headers
+	// via responses_metadata.routing_hint), not on individual frames.
+	if (identity.routingHint !== undefined)
+		result["x-codex-routing-hint"] = identity.routingHint
 	return result
 }
 
@@ -421,17 +507,43 @@ export class WebsocketConnection {
 		headers.Authorization = `Bearer ${accessToken}`
 		const factory =
 			this.options.webSocketFactory ??
-			(async (url: string, values: Record<string, string>) => {
+			(async (
+				url: string,
+				values: Record<string, string>,
+				onSetCookies?: HandshakeCookieObserver,
+			) => {
 				const undici = await loadUndici()
 				if (!undici) throw new Error("Websocket transport requires undici.")
-				return new undici.WebSocket(url, { headers: values })
+				return new undici.WebSocket(url, {
+					headers: values,
+					...(onSetCookies
+						? {
+								dispatcher: undici
+									.getGlobalDispatcher()
+									.compose(observeHandshakeCookies(onSetCookies)),
+							}
+						: {}),
+				})
 			})
 		const target = this.identity.url
 			? new URL(this.identity.url)
 			: new URL(toWebsocketUrl(this.options.baseURL))
 		target.protocol =
 			target.protocol === "http:" || target.protocol === "ws:" ? "ws:" : "wss:"
-		const socket = await factory(target.toString(), headers)
+		const jar = this.options.cookies
+		// Codex reuses the HTTP cookie store on secure handshakes; an explicit
+		// Cookie header (per-account `headers`) takes precedence.
+		const cookie = jar?.header(target)
+		if (
+			cookie !== undefined &&
+			!Object.keys(headers).some((name) => name.toLowerCase() === "cookie")
+		)
+			headers.Cookie = cookie
+		const socket = await factory(
+			target.toString(),
+			headers,
+			jar ? (setCookies) => jar.store(target, setCookies) : undefined,
+		)
 		if (this.closed || signal?.aborted) {
 			socket.close()
 			throw new Error("Websocket connection is closed or aborted.")
@@ -815,6 +927,9 @@ export class WebsocketConnectionManager {
 			identity.url,
 			identity.isFedRamp === true,
 			identity.sessionId ?? identity.installationId,
+			// Not keyed by routingHint: codex treats the handshake hint as advisory
+			// and reuses the socket after a model/tier change (client_websockets.rs
+			// responses_websocket_prewarm_reuses_advisory_model_and_tier_routing_hint).
 			accessToken,
 		])
 		let connection = this.connections.get(key)

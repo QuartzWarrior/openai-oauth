@@ -144,6 +144,14 @@ export class RequestBodyTooLargeError extends Error {
 	}
 }
 
+/** A client-side request problem, reported as a 400 instead of a server error. */
+export class InvalidRequestError extends Error {
+	constructor(message: string) {
+		super(message)
+		this.name = "InvalidRequestError"
+	}
+}
+
 export const limitRequestBody = (request: Request, limit: number): Request => {
 	const length = request.headers.get("content-length")
 	if (length !== null && Number(length) > limit) {

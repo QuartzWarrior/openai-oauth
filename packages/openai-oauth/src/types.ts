@@ -122,6 +122,9 @@ export type OpenAIOAuthServerLogEvent =
 			type: "chat_error"
 			durationMs: number
 			message: string
+			/** HTTP status returned downstream, when the failure was classified. */
+			status?: number
+			code?: string
 			path: "/v1/chat/completions"
 			requestId: string
 	  }

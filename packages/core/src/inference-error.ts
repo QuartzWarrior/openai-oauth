@@ -5,6 +5,8 @@ export type InferenceErrorCategory =
 	| "throttled"
 	| "quota"
 	| "overloaded"
+	/** Service-wide capacity (e.g. Flex); not attributable to one account. */
+	| "capacity"
 	| "request"
 	| "transport"
 	| "unknown"
@@ -31,6 +33,11 @@ const codes = new Set([
 	"insufficient_quota",
 	"quota_exceeded",
 	"billing_hard_limit_reached",
+	"credit_balance_exhausted",
+	"organization_spend_limit_exceeded",
+	"project_spend_limit_exceeded",
+	"organization_usage_limit_exceeded",
+	"flex_unavailable",
 	"server_is_overloaded",
 	"server_overloaded",
 	"overloaded",
@@ -40,6 +47,8 @@ const codes = new Set([
 	"previous_response_not_found",
 	"permission_denied",
 	"insufficient_permissions",
+	"invalid_prompt",
+	"bio_policy",
 ])
 const identifier = (value: unknown): string | undefined =>
 	typeof value === "string" &&
@@ -128,9 +137,17 @@ export const parseInferenceError = (
 			"insufficient_quota",
 			"quota_exceeded",
 			"billing_hard_limit_reached",
+			// codex-api api_bridge.rs maps these 429 codes to QuotaExceeded.
+			"credit_balance_exhausted",
+			"organization_spend_limit_exceeded",
+			"project_spend_limit_exceeded",
+			"organization_usage_limit_exceeded",
 		].includes(code ?? "")
 	)
 		category = "quota"
+	// Codex treats `flex_unavailable` (HTTP 429 or streamed) as a terminal
+	// capacity failure, not a rate limit (error.rs parse_flex_unavailable).
+	else if (code === "flex_unavailable") category = "capacity"
 	else if (
 		["rate_limit_exceeded", "rate_limit_error", "too_many_requests"].includes(
 			code ?? "",
@@ -152,6 +169,8 @@ export const parseInferenceError = (
 			"previous_response_not_found",
 			"permission_denied",
 			"insufficient_permissions",
+			"invalid_prompt",
+			"bio_policy",
 		].includes(code ?? "") ||
 		status === 400 ||
 		status === 403 ||

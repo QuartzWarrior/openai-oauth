@@ -7,7 +7,7 @@ import {
 } from "./chat-messages.js"
 import { resolveChatOutputLimit } from "./chat-output-limit.js"
 import { streamChatCompletions } from "./chat-stream.js"
-import { emitRequestLog } from "./logging.js"
+import { describeChatError, emitRequestLog } from "./logging.js"
 import {
 	isRecord,
 	mapFinishReason,
@@ -172,8 +172,7 @@ export const handleChatCompletionsRequest = async (
 			requestId,
 			path: "/v1/chat/completions",
 			durationMs: Date.now() - startedAt,
-			message:
-				error instanceof Error ? error.message : "Unexpected server error.",
+			...describeChatError(error),
 		})
 		throw error
 	}

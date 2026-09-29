@@ -3,6 +3,7 @@ import os from "node:os"
 import path from "node:path"
 import { afterEach, describe, expect, test, vi } from "vitest"
 import { createOpenAIOAuthFetchHandler } from "../src/index.js"
+import { createRequestLogger } from "../src/logging.js"
 
 const createAuthFile = async (): Promise<string> => {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "openai-oauth-server-"))
@@ -653,5 +654,188 @@ describe("openai oauth server", () => {
 				message: "`messages` must be an array.",
 			}),
 		)
+	})
+
+	test("rejects malformed image data URLs with a 400 before calling upstream", async () => {
+		const authFilePath = await createAuthFile()
+		const fetch = vi.fn(async () => Response.json({ models: [] }))
+		const handler = createOpenAIOAuthFetchHandler({
+			authFilePath,
+			ensureFresh: false,
+			fetch,
+		})
+
+		for (const stream of [false, true]) {
+			const response = await handler(
+				new Request("http://localhost/v1/chat/completions", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({
+						model: "gpt-5.4",
+						stream,
+						messages: [
+							{
+								role: "user",
+								content: [
+									{
+										type: "image_url",
+										image_url: { url: "data:image/png;base64,not-an-image!!" },
+									},
+								],
+							},
+						],
+					}),
+				}),
+			)
+
+			expect(response.status).toBe(400)
+			await expect(response.json()).resolves.toEqual({
+				error: {
+					message: "Invalid image data URL: payload is not valid base64.",
+					type: "invalid_request_error",
+				},
+			})
+		}
+		expect(
+			fetch.mock.calls.some(([input]) => String(input).includes("/responses")),
+		).toBe(false)
+
+		await fs.rm(path.dirname(authFilePath), { recursive: true, force: true })
+	})
+
+	describe("upstream errors", () => {
+		const chatWith = async (upstream: () => Response, stream: boolean) => {
+			const authFilePath = await createAuthFile()
+			const requestLogger = vi.fn()
+			const handler = createOpenAIOAuthFetchHandler({
+				authFilePath,
+				codexVersion: "0.144.1",
+				ensureFresh: false,
+				requestLogger,
+				fetch: async (input) =>
+					String(input).includes("/backend-api/codex/models?")
+						? Response.json({
+								models: [{ slug: "gpt-5.4", visibility: "list" }],
+							})
+						: upstream(),
+			})
+			const response = await handler(
+				new Request("http://localhost/v1/chat/completions", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({
+						model: "gpt-5.4",
+						stream,
+						messages: [{ role: "user", content: "hi" }],
+					}),
+				}),
+			)
+			await fs.rm(path.dirname(authFilePath), { recursive: true, force: true })
+			return { response, requestLogger }
+		}
+
+		for (const stream of [false, true]) {
+			test(`passes upstream request errors through as 4xx (stream=${stream})`, async () => {
+				const { response, requestLogger } = await chatWith(
+					() =>
+						Response.json(
+							{
+								error: {
+									message: "Invalid image data",
+									type: "invalid_request_error",
+									code: "invalid_image",
+								},
+							},
+							{ status: 400 },
+						),
+					stream,
+				)
+
+				expect(response.status).toBe(400)
+				await expect(response.json()).resolves.toEqual({
+					error: {
+						message: "Invalid image data",
+						type: "invalid_request_error",
+						code: "invalid_image",
+					},
+				})
+				expect(requestLogger).toHaveBeenCalledWith(
+					expect.objectContaining({
+						type: "chat_error",
+						status: 400,
+						code: "invalid_image",
+					}),
+				)
+			})
+
+			test(`reports response.failed as an error, not an empty success (stream=${stream})`, async () => {
+				const { response } = await chatWith(
+					() =>
+						new Response(
+							[
+								"event: response.created",
+								'data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.4","created_at":1}}',
+								"",
+								"event: response.failed",
+								'data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"code":"context_length_exceeded","message":"too long"}}}',
+								"",
+								"",
+							].join("\n"),
+							{ headers: { "content-type": "text/event-stream" } },
+						),
+					stream,
+				)
+
+				expect(response.status).toBe(400)
+				await expect(response.json()).resolves.toMatchObject({
+					error: {
+						type: "invalid_request_error",
+						code: "context_length_exceeded",
+					},
+				})
+			})
+		}
+
+		test("hides upstream account rejections behind a 502", async () => {
+			const { response } = await chatWith(
+				() =>
+					Response.json(
+						{ detail: "Plan does not allow this model." },
+						{ status: 403 },
+					),
+				false,
+			)
+
+			expect(response.status).toBe(502)
+			await expect(response.json()).resolves.toEqual({
+				error: { message: "Upstream request failed.", type: "upstream_error" },
+			})
+		})
+	})
+
+	test("logs only errors when CODEX_OPENAI_SERVER_LOG_REQUESTS=errors", () => {
+		vi.stubEnv("CODEX_OPENAI_SERVER_LOG_REQUESTS", "errors")
+		const log = vi.spyOn(console, "log").mockImplementation(() => undefined)
+		const logger = createRequestLogger({})
+
+		logger?.({
+			type: "chat_request",
+			requestId: "r1",
+			path: "/v1/chat/completions",
+		} as Parameters<NonNullable<typeof logger>>[0])
+		logger?.({
+			type: "chat_error",
+			requestId: "r1",
+			path: "/v1/chat/completions",
+			durationMs: 1,
+			message: "boom",
+		})
+
+		expect(log).toHaveBeenCalledOnce()
+		expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toMatchObject({
+			type: "chat_error",
+			message: "boom",
+		})
+		vi.unstubAllEnvs()
 	})
 })

@@ -189,6 +189,11 @@ export const computeUnavailability = (input: {
 	}
 
 	const { code, type, resetAt } = extractErrorFields(input.bodyText)
+	// Flex capacity is service-wide (codex error.rs parse_flex_unavailable);
+	// benching this account would not help and would starve healthy capacity.
+	if (isRateLimit && code === "flex_unavailable") {
+		return undefined
+	}
 	const retryAfterMs = parseRetryAfterMs(input.headers, now)
 	const backoffMs = Math.min(
 		MAX_BACKOFF_MS,

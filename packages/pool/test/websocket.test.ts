@@ -256,6 +256,18 @@ describe("websocket transport", () => {
 		expect(headers["session-id"]).toBe("install-only")
 	})
 
+	it("sends the routing hint on the handshake and ignores header overrides", () => {
+		const headers = buildWebsocketUpgradeHeaders(
+			{ ...identity, routingHint: "model=gpt-5.6-sol;tier=priority" },
+			TEST_CODEX_VERSION,
+			{ "X-Codex-Routing-Hint": "model=configured-override" },
+		)
+		expect(headers["x-codex-routing-hint"]).toBe(
+			"model=gpt-5.6-sol;tier=priority",
+		)
+		expect(headers).not.toHaveProperty("X-Codex-Routing-Hint")
+	})
+
 	it("lets per-account header overrides win", () => {
 		const headers = buildWebsocketUpgradeHeaders(identity, TEST_CODEX_VERSION, {
 			Origin: "https://example.test",
@@ -509,6 +521,59 @@ describe("websocket transport", () => {
 			"Bearer another-token",
 		)
 		expect(FakeWebSocket.instances[0].url).not.toContain("access_token")
+		await transport.close()
+	})
+
+	it("resends full input on a fresh socket when the account owner changes mid-conversation", async () => {
+		// Mirrors codex #44489: an auth-owner switch must not reuse the previous
+		// account's socket, previous_response_id or turn state.
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock()
+		const transport = makeTestTransport(clock)
+		const first = [{ role: "user", content: "one" }]
+		const second = [...first, { role: "assistant", content: "two" }]
+		const third = [...second, { role: "user", content: "three" }]
+		const { socket: socketA } = await roundTrip(
+			clock,
+			transport,
+			{ model: "gpt-5", input: first },
+			{ ...identity, turnState: "turn-state-a" },
+		)
+		const switched: WebsocketIdentity = {
+			...identity,
+			accountId: "acct-switched",
+		}
+		const { socket: socketB } = await roundTrip(
+			clock,
+			transport,
+			{ model: "gpt-5", input: second },
+			switched,
+			"switched-token",
+		)
+		expect(socketB).not.toBe(socketA)
+		expect(socketB.headers["chatgpt-account-id"]).toBe("acct-switched")
+		expect(socketB.headers.Authorization).toBe("Bearer switched-token")
+		const [switchedCreate] = socketB.framesOfType("response.create")
+		expect(switchedCreate).toMatchObject({ input: second })
+		expect(switchedCreate).not.toHaveProperty("previous_response_id")
+		expect(switchedCreate?.client_metadata).not.toHaveProperty(
+			"x-codex-turn-state",
+		)
+		expect(socketA.framesOfType("response.create")).toHaveLength(1)
+
+		// The new owner's socket then resumes normal incremental reuse.
+		await roundTrip(
+			clock,
+			transport,
+			{ model: "gpt-5", input: third },
+			switched,
+			"switched-token",
+		)
+		expect(FakeWebSocket.instances).toHaveLength(2)
+		expect(socketB.framesOfType("response.create")[1]).toMatchObject({
+			input: [{ role: "user", content: "three" }],
+			previous_response_id: expect.any(String),
+		})
 		await transport.close()
 	})
 

@@ -249,6 +249,7 @@ describe("createCodexOAuthFetch", () => {
 		const headers = new Headers(init?.headers)
 		const body = JSON.parse(String(init?.body))
 		expect(headers.get("x-openai-internal-codex-responses-lite")).toBe("true")
+		expect(headers.get("x-codex-routing-hint")).toBe("model=gpt-5.6-sol")
 		expect(body.stream).toBe(true)
 		expect(body).toMatchObject({
 			instructions: "",
@@ -272,6 +273,48 @@ describe("createCodexOAuthFetch", () => {
 				content: [{ type: "input_text", text: "Hello" }],
 			},
 		])
+	})
+
+	test("derives the routing hint from the body, not caller headers", async () => {
+		const fetch = createMockFetch()
+		const oauthFetch = createCodexOAuthFetch({ auth: session, fetch })
+
+		await oauthFetch("https://example.test/v1/responses", {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				"x-codex-routing-hint": "model=caller-supplied",
+			},
+			body: JSON.stringify({
+				model: "gpt-5.6-sol",
+				input: "Hello",
+				service_tier: "priority",
+			}),
+		})
+
+		const [, init] = upstreamCalls(fetch)[0] ?? []
+		expect(new Headers(init?.headers).get("x-codex-routing-hint")).toBe(
+			"model=gpt-5.6-sol;tier=priority",
+		)
+	})
+
+	test("a minted session id also lands in client_metadata", async () => {
+		const fetch = createMockFetch()
+		const oauthFetch = createCodexOAuthFetch({ auth: session, fetch })
+
+		await oauthFetch("https://example.test/v1/responses", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ model: "gpt-5.6-sol", input: "Hello" }),
+		})
+
+		const [, init] = upstreamCalls(fetch)[0] ?? []
+		const sessionId = new Headers(init?.headers).get("session-id")
+		expect(sessionId).toBeTruthy()
+		expect(JSON.parse(String(init?.body)).client_metadata).toMatchObject({
+			session_id: sessionId,
+			thread_id: sessionId,
+		})
 	})
 
 	test("reconstructs FedRAMP routing from the trusted session", async () => {

@@ -1,12 +1,12 @@
 import type { OpenAIOAuthProvider } from "@openai-oauth/ai-sdk"
-import { streamText } from "ai"
+import { streamText, type TextStreamPart, type ToolSet } from "ai"
 import {
 	createToolSet,
 	toModelMessages,
 	toToolChoice,
 } from "./chat-messages.js"
 import { resolveChatOutputLimit } from "./chat-output-limit.js"
-import { emitRequestLog } from "./logging.js"
+import { describeChatError, emitRequestLog } from "./logging.js"
 import {
 	mapFinishReason,
 	sseHeaders,
@@ -18,6 +18,11 @@ import type {
 	OpenAIOAuthServerLogEvent,
 	UsageLike,
 } from "./types.js"
+import {
+	describeUpstreamError,
+	toUpstreamErrorBody,
+	toUpstreamErrorResponse,
+} from "./upstream-error.js"
 
 const encodeSse = (data: unknown): Uint8Array =>
 	new TextEncoder().encode(`data: ${JSON.stringify(data)}\n\n`)
@@ -90,6 +95,43 @@ export const streamChatCompletions = async (
 	signal?.addEventListener("abort", abort, { once: true })
 	if (signal?.aborted) abort()
 
+	const logError = (error: unknown) =>
+		emitRequestLog(logContext.logger, {
+			type: "chat_error",
+			requestId: logContext.requestId,
+			path: "/v1/chat/completions",
+			durationMs: Date.now() - logContext.startedAt,
+			...describeChatError(error),
+		})
+
+	// Hold the 200 until the first real part, so failures before any output
+	// (upstream 4xx, `response.failed`) reach the caller as an HTTP status.
+	const parts = result.fullStream[Symbol.asyncIterator]()
+	const buffered: Array<TextStreamPart<ToolSet>> = []
+	for (;;) {
+		const next = await parts.next()
+		if (next.done) break
+		buffered.push(next.value)
+		if (next.value.type !== "start" && next.value.type !== "start-step") break
+	}
+	const early = buffered.at(-1)
+	if (early?.type === "abort") {
+		signal?.removeEventListener("abort", abort)
+		abortController.signal.throwIfAborted()
+		throw new Error("Streaming chat completion was aborted.")
+	}
+	if (early?.type === "error") {
+		signal?.removeEventListener("abort", abort)
+		logError(early.error)
+		const response = toUpstreamErrorResponse(early.error)
+		if (response) return response
+		throw early.error
+	}
+	const allParts = async function* () {
+		yield* buffered
+		yield* { [Symbol.asyncIterator]: () => parts }
+	}
+
 	const chunks = async function* () {
 		yield encodeSse({
 			id,
@@ -101,7 +143,7 @@ export const streamChatCompletions = async (
 			],
 		})
 
-		for await (const part of result.fullStream) {
+		for await (const part of allParts()) {
 			switch (part.type) {
 				case "text-delta":
 					yield encodeSse({
@@ -233,20 +275,19 @@ export const streamChatCompletions = async (
 						usage: toUsage(part.totalUsage),
 					})
 					break
-				case "error":
-					emitRequestLog(logContext.logger, {
-						type: "chat_error",
-						requestId: logContext.requestId,
-						path: "/v1/chat/completions",
-						durationMs: Date.now() - logContext.startedAt,
-						message:
-							part.error instanceof Error
-								? part.error.message
-								: "Streaming chat completion failed.",
-					})
+				case "error": {
+					logError(part.error)
+					// Headers are already sent: report upstream failures in-band the
+					// way OpenAI does, and end the stream without [DONE].
+					const upstream = describeUpstreamError(part.error)
+					if (upstream) {
+						yield encodeSse(toUpstreamErrorBody(upstream))
+						return
+					}
 					throw part.error instanceof Error
 						? part.error
 						: new Error("Streaming chat completion failed.")
+				}
 			}
 		}
 

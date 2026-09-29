@@ -30,6 +30,7 @@ import {
 	parseCodexRateHeaders,
 	rateSnapshotUtilization,
 } from "./account-state.js"
+import { ChatGptCookieJar, withChatGptCookies } from "./cookie-jar.js"
 import { weightedLoad } from "./inflight-tracker.js"
 import {
 	type PoolQuotaStats,
@@ -156,6 +157,7 @@ type PoolAccount = {
 	turnStates: ReplayMap<string>
 	wsTransport?: WebsocketTransport
 	runtime: AccountRuntime
+	cookies: ChatGptCookieJar
 }
 
 type Owner = {
@@ -185,6 +187,14 @@ const abortable = <T>(
 			.then(resolve, reject)
 			.finally(() => signal.removeEventListener("abort", abort))
 	})
+}
+
+/** Pool-wide admission failure; not attributable to any one account. */
+class PoolCapacityError extends InferenceError {
+	constructor(message: string) {
+		super({ category: "capacity" })
+		this.message = message
+	}
 }
 
 /** Keep the queue tail fulfilled even when one caller's operation fails. */
@@ -310,6 +320,9 @@ export const createOpenAIPool = async (
 				: accountConfig.proxy
 					? await createProxyRuntime(accountConfig.proxy)
 					: createPlainRuntime()
+			// Per-account ChatGPT infrastructure cookies, shared by HTTP and WS.
+			const cookies = new ChatGptCookieJar(now)
+			const cookieFetch = withChatGptCookies(runtime.fetch, cookies)
 			let wsTransport: WebsocketTransport | undefined
 			try {
 				const persistedId = await readAuthInstallationId(
@@ -362,6 +375,7 @@ export const createOpenAIPool = async (
 						headers: accountConfig.headers,
 						terminalToken,
 						now,
+						cookies,
 					})
 				}
 				const account: PoolAccount = {
@@ -379,6 +393,7 @@ export const createOpenAIPool = async (
 					transportFetch: runtime.fetch,
 					wsTransport,
 					runtime,
+					cookies,
 				}
 				account.lockedGetSession = createLockedGetSession(
 					async () => {
@@ -399,6 +414,7 @@ export const createOpenAIPool = async (
 							account.quota.clear()
 							account.conversationIds.clear()
 							account.turnStates.clear()
+							account.cookies.clear()
 						}
 						account.lastSession = session
 					},
@@ -413,7 +429,7 @@ export const createOpenAIPool = async (
 						...accountConfig.headers,
 						installation_id: installationId,
 					},
-					fetch: runtime.fetch,
+					fetch: cookieFetch,
 					terminalToken,
 					signal: lifecycle.signal,
 					onResponseCompleted: (response, context) => {
@@ -470,7 +486,7 @@ export const createOpenAIPool = async (
 							throw new Error("Continuation credential owner changed.")
 						const requestInit = { ...init, headers }
 						if (!account.wsTransport) {
-							const response = await runtime.fetch(url, requestInit)
+							const response = await cookieFetch(url, requestInit)
 							if (
 								owns(account, session) &&
 								!lifecycle.signal.aborted &&
@@ -503,6 +519,7 @@ export const createOpenAIPool = async (
 										: undefined,
 								turnState: headers.get("x-codex-turn-state") ?? undefined,
 								signal: init.signal ?? undefined,
+								routingHint: headers.get("x-codex-routing-hint") ?? undefined,
 								responsesLite:
 									headers.get("x-openai-internal-codex-responses-lite") ===
 									"true",
@@ -689,10 +706,24 @@ export const createOpenAIPool = async (
 				return account
 			}
 			if (waiters.size >= maxQueued)
-				throw new Error("Pool admission queue is full.")
+				throw new PoolCapacityError("Pool admission queue is full.")
 			const remaining = queueTimeout - (Date.now() - started)
 			if (remaining <= 0)
-				throw new Error("Timed out waiting for pool capacity.")
+				throw new PoolCapacityError("Timed out waiting for pool capacity.")
+			// Every candidate is cooling down past the admission budget, so waiting
+			// cannot succeed; fail now and let the caller route elsewhere.
+			const earliest = Math.min(
+				...(prefer ? [prefer] : accounts).map((item) =>
+					item.quarantineVersion === undefined
+						? item.health.unavailableUntil - now()
+						: 0,
+				),
+			)
+			if (earliest > remaining)
+				throw new InferenceError({
+					category: "throttled",
+					retryAt: now() + earliest,
+				})
 			await new Promise<void>((resolve, reject) => {
 				let timer: ReturnType<typeof setTimeout>
 				const cleanup = () => {

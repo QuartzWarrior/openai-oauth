@@ -73,16 +73,18 @@ describe("chat translation fidelity", () => {
 		)
 		const options = vi.mocked(streamText).mock.calls[0]?.[0]
 		expect(options?.tools?.answer?.strict).toBe(true)
-		expect(yielded).toBe(0)
+		// Only the first part is read ahead, to catch errors before the 200.
+		expect(yielded).toBe(1)
 		if (!response.body) throw new Error("Expected streaming body")
 		const reader = response.body.getReader()
 		await reader.read() // role chunk does not consume upstream
-		expect(yielded).toBe(0)
-		await reader.read()
+		await reader.read() // the read-ahead part
 		expect(yielded).toBe(1)
+		await reader.read()
+		expect(yielded).toBe(2)
 		await reader.cancel("disconnect")
 		expect(options?.abortSignal?.aborted).toBe(true)
-		expect(yielded).toBe(1)
+		expect(yielded).toBe(2)
 	})
 
 	test.each([
@@ -131,6 +133,7 @@ describe("chat translation fidelity", () => {
 			(options) =>
 				({
 					fullStream: (async function* () {
+						yield { type: "text-delta", text: "first" }
 						await new Promise<void>((_resolve, reject) =>
 							options.abortSignal?.addEventListener(
 								"abort",
@@ -152,8 +155,37 @@ describe("chat translation fidelity", () => {
 		if (!response.body) throw new Error("Expected streaming body")
 		const reader = response.body.getReader()
 		await reader.read()
+		await reader.read()
 		const pending = reader.read()
 		const rejected = expect(pending).rejects.toThrow("stop")
+		controller.abort(new Error("stop"))
+		await rejected
+	})
+
+	test("caller abort before the first part settles the response", async () => {
+		vi.mocked(streamText).mockImplementation(
+			(options) =>
+				({
+					fullStream: (async function* () {
+						await new Promise<void>((_resolve, reject) =>
+							options.abortSignal?.addEventListener(
+								"abort",
+								() => reject(options.abortSignal?.reason),
+								{ once: true },
+							),
+						)
+						yield { type: "text-delta", text: "unreachable" }
+					})(),
+				}) as unknown as ReturnType<typeof streamText>,
+		)
+		const controller = new AbortController()
+		const response = streamChatCompletions(
+			{ messages: [] },
+			provider,
+			{ requestId: "r", startedAt: 0 },
+			controller.signal,
+		)
+		const rejected = expect(response).rejects.toThrow("stop")
 		controller.abort(new Error("stop"))
 		await rejected
 	})

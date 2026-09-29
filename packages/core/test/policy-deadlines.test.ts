@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest"
 import { InferenceError, parseInferenceError } from "../src/inference-error.js"
 import {
+	DEFAULT_CODEX_CLIENT_VERSION,
 	resetCodexClientVersionCache,
 	resolveCodexClientVersion,
 } from "../src/models.js"
@@ -140,7 +141,7 @@ describe("operation-owned discovery deadlines", () => {
 		)
 		await expect(
 			resolveCodexClientVersion({ fetchImpl: fetch, timeoutMs: 20 }),
-		).resolves.toBe("0.154.0")
+		).resolves.toBe(DEFAULT_CODEX_CLIENT_VERSION)
 		await expect(
 			resolveCodexClientVersion({ fetchImpl: fetch, timeoutMs: 100 }),
 		).resolves.toBe("1.2.3")
@@ -338,5 +339,39 @@ describe("stream deadlines and completion seams", () => {
 				{ now: 1000 },
 			).retryAt,
 		).toBe(20_000)
+	})
+	test("classifies codex quota, capacity and policy codes", () => {
+		for (const code of [
+			"credit_balance_exhausted",
+			"organization_spend_limit_exceeded",
+			"project_spend_limit_exceeded",
+			"organization_usage_limit_exceeded",
+		])
+			expect(
+				parseInferenceError({ error: { code } }, { status: 429 }),
+			).toMatchObject({ category: "quota", code })
+		expect(
+			parseInferenceError(
+				{ error: { code: "flex_unavailable" } },
+				{ status: 429 },
+			),
+		).toMatchObject({ category: "capacity", code: "flex_unavailable" })
+		expect(
+			parseInferenceError({
+				type: "response.failed",
+				response: { error: { code: "flex_unavailable" } },
+			}).category,
+		).toBe("capacity")
+		for (const code of ["invalid_prompt", "bio_policy"])
+			expect(parseInferenceError({ error: { code } })).toMatchObject({
+				category: "request",
+				code,
+			})
+		expect(
+			parseInferenceError(
+				{ error: { code: "rate_limit_exceeded" } },
+				{ status: 429 },
+			).category,
+		).toBe("throttled")
 	})
 })

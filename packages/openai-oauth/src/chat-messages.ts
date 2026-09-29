@@ -1,5 +1,5 @@
 import { jsonSchema, type ModelMessage, tool } from "ai"
-import { isJsonValue, isRecord } from "./shared.js"
+import { InvalidRequestError, isJsonValue, isRecord } from "./shared.js"
 import type {
 	ChatMessage,
 	ChatToolChoice,
@@ -70,6 +70,62 @@ const toTextParts = (content: unknown): string => {
 		.join("")
 }
 
+type UserImagePart = {
+	type: "image"
+	image: URL | string | Uint8Array
+	mediaType?: string
+	providerOptions?: { openai: { imageDetail: string } }
+}
+
+const DATA_URL_PATTERN = /^data:([^,]*?),(.*)$/s
+
+// Mirrors the AI SDK's decoder (base64url folded to base64, then atob), which
+// otherwise throws a DOMException mid-request and surfaces as a generic 500.
+const isDecodableBase64 = (payload: string) => {
+	try {
+		atob(payload.replace(/-/g, "+").replace(/_/g, "/"))
+		return true
+	} catch {
+		return false
+	}
+}
+
+// The AI SDK only passes http(s) URLs through to the model and tries to
+// download everything else, so inline data URLs must become raw content.
+const toImageSource = (
+	url: string,
+): Pick<UserImagePart, "image" | "mediaType"> | undefined => {
+	const dataUrl = DATA_URL_PATTERN.exec(url)
+	if (dataUrl) {
+		const [, meta = "", payload = ""] = dataUrl
+		const params = meta.split(";")
+		const mediaType = params[0] || undefined
+		if (params.slice(1).includes("base64")) {
+			const image = payload.replace(/\s/g, "")
+			if (!isDecodableBase64(image))
+				throw new InvalidRequestError(
+					"Invalid image data URL: payload is not valid base64.",
+				)
+			return { image, mediaType }
+		}
+		let decoded: string
+		try {
+			decoded = decodeURIComponent(payload)
+		} catch {
+			throw new InvalidRequestError(
+				"Invalid image data URL: payload is not valid percent-encoding.",
+			)
+		}
+		return { image: new TextEncoder().encode(decoded), mediaType }
+	}
+
+	try {
+		return { image: new URL(url) }
+	} catch {
+		return undefined
+	}
+}
+
 const toUserContent = (content: unknown) => {
 	if (typeof content === "string") {
 		return content
@@ -79,10 +135,7 @@ const toUserContent = (content: unknown) => {
 		return ""
 	}
 
-	const parts: Array<
-		| { type: "text"; text: string }
-		| { type: "image"; image: URL; mediaType?: string }
-	> = []
+	const parts: Array<{ type: "text"; text: string } | UserImagePart> = []
 
 	for (const item of content) {
 		if (!isRecord(item) || typeof item.type !== "string") {
@@ -99,9 +152,18 @@ const toUserContent = (content: unknown) => {
 			isRecord(item.image_url) &&
 			typeof item.image_url.url === "string"
 		) {
-			try {
-				parts.push({ type: "image", image: new URL(item.image_url.url) })
-			} catch {}
+			const source = toImageSource(item.image_url.url)
+			if (!source) continue
+			// Codex always sends a detail, defaulting to "high" (DEFAULT_IMAGE_DETAIL).
+			const detail =
+				typeof item.image_url.detail === "string"
+					? item.image_url.detail
+					: "high"
+			parts.push({
+				type: "image",
+				...source,
+				providerOptions: { openai: { imageDetail: detail } },
+			})
 		}
 	}
 

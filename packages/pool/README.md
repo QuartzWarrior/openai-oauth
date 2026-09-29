@@ -73,6 +73,8 @@ The package uses a dedicated undici `ProxyAgent` on Node.js 20.18.1 or newer. Un
 
 A WebSocket configuration with a proxy or custom fetch deliberately uses HTTP when the WebSocket implementation cannot honor that route. It must not silently connect directly. Account-routing headers, including the FedRAMP flag, are rebuilt from the selected trusted session rather than arbitrary caller overrides.
 
+Like Codex, each account retains ChatGPT infrastructure cookies (Cloudflare service cookies and the `__oailb` routing cookie) from HTTPS responses and WebSocket upgrades, and replays them on later HTTPS requests and secure handshakes to ChatGPT hosts. Account, session and auth cookies are never stored, and an explicit `Cookie` header wins. Unlike Codex's process-wide store, every account has its own jar, cleared when its credential owner changes, so these cookies never link accounts.
+
 ## Streaming and WebSocket behavior
 
 Set `transport: "websocket"` only where the available connector supports the intended route. The protocol bridge shares HTTP request normalization and response finalization, including `stream: false` aggregation.
@@ -96,6 +98,8 @@ The scheduler uses weighted in-flight load and health observations. In-flight in
 | `queueTimeoutMs` | 300000 | Maximum admission wait |
 | `maxRequestBodyBytes` | 8388608 | Maximum body inspected by the pool |
 | `healthRefreshMs` | disabled | `true` probes every 60 seconds; a positive integer sets the interval |
+
+A `flex_unavailable` 429 is service-wide Flex capacity, so it fails the request without cooling the account (core reports it as the `capacity` category).
 
 These local limits do not grant upstream quota. `Retry-After` is honored; a rate window's length is not treated as its remaining reset time. Utilization observations have their own freshness and are not reset deadlines. A synthetic concurrent test is not a production-throughput benchmark.
 

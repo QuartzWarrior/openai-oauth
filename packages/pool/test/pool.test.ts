@@ -1,3 +1,4 @@
+import { InferenceError } from "@openai-oauth/core"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
 	computeUnavailability,
@@ -139,6 +140,25 @@ describe("account-state helpers", () => {
 			now: 0,
 		})
 		expect(result?.retriableOnOtherAccount).toBe(false)
+	})
+
+	it("does not bench an account for service-wide Flex capacity", () => {
+		expect(
+			computeUnavailability({
+				status: 429,
+				bodyText: JSON.stringify({ error: { code: "flex_unavailable" } }),
+				consecutiveFailures: 0,
+				now: 0,
+			}),
+		).toBeUndefined()
+		expect(
+			computeUnavailability({
+				status: 429,
+				bodyText: JSON.stringify({ error: { code: "rate_limit_exceeded" } }),
+				consecutiveFailures: 0,
+				now: 0,
+			}),
+		).toBeDefined()
 	})
 
 	it("ignores non-rate/auth failures", () => {
@@ -790,6 +810,57 @@ describe("createOpenAIPool", () => {
 		await pool.destroy()
 	})
 
+	it("fails fast when every account cools past the admission budget", async () => {
+		stubModelCatalog()
+		let responsesCalls = 0
+		const limited = (async (input: RequestInfo | URL) => {
+			if (isModelsUrl(input)) return modelsResponse()
+			responsesCalls += 1
+			return new Response(
+				JSON.stringify({ error: { code: "rate_limit_exceeded" } }),
+				{
+					status: 429,
+					headers: {
+						"content-type": "application/json",
+						"retry-after": "3600",
+					},
+				},
+			)
+		}) as typeof fetch
+		const pool = await createOpenAIPool({
+			codexVersion: TEST_CODEX_VERSION,
+			queueTimeoutMs: 60_000,
+			accounts: [
+				{ authFilePath: makeAuthFile({ accountId: "acct-a" }), fetch: limited },
+				{ authFilePath: makeAuthFile({ accountId: "acct-b" }), fetch: limited },
+			],
+		})
+		for (let i = 0; i < 2; i += 1) {
+			const response = await pool.fetch(
+				"https://chatgpt.com/backend-api/codex/responses",
+				uniqueRequestInit(),
+			)
+			expect(response.status).toBe(429)
+			await response.text()
+		}
+
+		const started = Date.now()
+		const rejection = await pool
+			.fetch(
+				"https://chatgpt.com/backend-api/codex/responses",
+				uniqueRequestInit(),
+			)
+			.catch((error: unknown) => error)
+		expect(Date.now() - started).toBeLessThan(1_000)
+		expect(rejection).toBeInstanceOf(InferenceError)
+		expect(rejection).toMatchObject({ category: "throttled" })
+		expect((rejection as InferenceError).retryAt).toBeGreaterThan(
+			Date.now() + 3_500_000,
+		)
+		expect(responsesCalls).toBe(2)
+		await pool.destroy()
+	})
+
 	it("queues requests while all accounts cool and dispatches on recovery", async () => {
 		// Real timers: the fake clock races real auth-file I/O, so the scheduled
 		// retry back-off intermittently gets swallowed. A ~150ms Retry-After is
@@ -1245,7 +1316,9 @@ describe("createOpenAIPool", () => {
 			expect(pool.stats()[0]).toMatchObject({
 				healthy: true,
 				codex: { primaryUsedPercent: 37 },
-				quota: { families: [{ limitId: "codex", primary: { usedPercent: 37 } }] },
+				quota: {
+					families: [{ limitId: "codex", primary: { usedPercent: 37 } }],
+				},
 			})
 			await waitFor(() => modelCalls === 2, "scheduled health refresh")
 			expect(modelCalls).toBe(2)

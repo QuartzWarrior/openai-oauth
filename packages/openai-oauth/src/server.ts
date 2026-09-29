@@ -26,6 +26,7 @@ import {
 	DEFAULT_HOST,
 	DEFAULT_MAX_REQUEST_BODY_BYTES,
 	DEFAULT_PORT,
+	InvalidRequestError,
 	limitRequestBody,
 	RequestBodyTooLargeError,
 	resolveAddress,
@@ -38,6 +39,7 @@ import type {
 	OpenAIOAuthServerOptions,
 	RunningOpenAIOAuthServer,
 } from "./types.js"
+import { toUpstreamErrorResponse } from "./upstream-error.js"
 
 const handleRoutes = async (
 	request: Request,
@@ -211,6 +213,10 @@ const createOpenAIOAuthRuntime = (settings: OpenAIOAuthServerOptions = {}) => {
 				)
 			if (error instanceof RequestBodyTooLargeError)
 				return responseFor(toErrorResponse(error.message, 413))
+			if (error instanceof InvalidRequestError)
+				return responseFor(toErrorResponse(error.message))
+			const upstream = toUpstreamErrorResponse(error)
+			if (upstream) return responseFor(upstream)
 			if (error instanceof SyntaxError)
 				return responseFor(toErrorResponse("Request body must be valid JSON."))
 			return responseFor(
