@@ -424,6 +424,18 @@ const BLOCKING_REACHED_TYPES = new Set([
 	"workspace_member_usage_limit_reached",
 ])
 
+/** Human label from the window's own length, e.g. `weekly`, `5h`. */
+export const windowLabel = (
+	windowMinutes: number | undefined,
+	fallback: string,
+): string => {
+	if (windowMinutes === undefined || windowMinutes <= 0) return fallback
+	if (windowMinutes === 10_080) return "weekly"
+	if (windowMinutes % 1_440 === 0) return `${windowMinutes / 1_440}d`
+	if (windowMinutes % 60 === 0) return `${windowMinutes / 60}h`
+	return `${windowMinutes}m`
+}
+
 export type UsageBlock = {
 	/** Latest known reset of a saturated window; undefined when unknown. */
 	until?: number
@@ -450,17 +462,24 @@ export const evaluateUsageBlock = (
 ): UsageBlock | undefined => {
 	const onCredits =
 		usage.credits?.unlimited === true || usage.credits?.hasCredits === true
+	// Slots are not durations: some plans report the weekly window as primary.
 	const saturated = (
 		[
-			["weekly", usage.secondary],
-			["5h", usage.primary],
+			["secondary", usage.secondary],
+			["primary", usage.primary],
 		] as const
-	).filter(
-		([, window]) =>
-			window !== undefined &&
-			window.usedPercent >= 100 &&
-			(window.resetAt === undefined || window.resetAt > now),
 	)
+		.filter(
+			([, window]) =>
+				window !== undefined &&
+				window.usedPercent >= 100 &&
+				(window.resetAt === undefined || window.resetAt > now),
+		)
+		.map(
+			([slot, window]) =>
+				[windowLabel(window?.windowMinutes, slot), window] as const,
+		)
+		.sort(([, a], [, b]) => (b?.windowMinutes ?? 0) - (a?.windowMinutes ?? 0))
 	const explicit =
 		usage.allowed === false ||
 		usage.spendControlReached === true ||

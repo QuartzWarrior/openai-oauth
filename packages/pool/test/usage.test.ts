@@ -149,10 +149,49 @@ describe("evaluateUsageBlock", () => {
 	it("blocks a saturated weekly window until its reset", () => {
 		expect(
 			evaluateUsageBlock(
-				{ secondary: { usedPercent: 100, resetAt: 9_000 } },
+				{
+					secondary: {
+						usedPercent: 100,
+						windowMinutes: 10_080,
+						resetAt: 9_000,
+					},
+				},
 				now,
 			),
 		).toEqual({ until: 9_000, reason: "usage limit reached (weekly)" })
+	})
+	it("labels windows by length, not slot", () => {
+		// prolite reports its weekly window as primary.
+		expect(
+			evaluateUsageBlock(
+				{
+					primary: { usedPercent: 100, windowMinutes: 10_080, resetAt: 9_000 },
+				},
+				now,
+			)?.reason,
+		).toBe("usage limit reached (weekly)")
+		expect(
+			evaluateUsageBlock(
+				{
+					primary: { usedPercent: 100, windowMinutes: 300, resetAt: 2_000 },
+					secondary: {
+						usedPercent: 100,
+						windowMinutes: 10_080,
+						resetAt: 9_000,
+					},
+				},
+				now,
+			),
+		).toEqual({ until: 9_000, reason: "usage limit reached (weekly)" })
+		expect(
+			evaluateUsageBlock(
+				{ primary: { usedPercent: 100, windowMinutes: 300 } },
+				now,
+			)?.reason,
+		).toBe("usage limit reached (5h)")
+		expect(
+			evaluateUsageBlock({ secondary: { usedPercent: 100 } }, now)?.reason,
+		).toBe("usage limit reached (secondary)")
 	})
 	it("lets credits carry a saturated window but not allowed:false", () => {
 		const secondary = { usedPercent: 100, resetAt: 9_000 }

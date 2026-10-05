@@ -821,6 +821,7 @@ export const createOpenAIPool = async (
 						? undefined
 						: {
 								usedPercent: rate.primaryUsedPercent,
+								windowMinutes: rate.primaryWindowMinutes,
 								resetAt: rate.primaryResetAt,
 							},
 				secondary:
@@ -828,6 +829,7 @@ export const createOpenAIPool = async (
 						? undefined
 						: {
 								usedPercent: rate.secondaryUsedPercent,
+								windowMinutes: rate.secondaryWindowMinutes,
 								resetAt: rate.secondaryResetAt,
 							},
 				credits,
@@ -922,7 +924,15 @@ export const createOpenAIPool = async (
 			used === undefined || (resetAt !== undefined && resetAt <= at) ? 0 : used
 		const primary = value(rate?.primaryUsedPercent, rate?.primaryResetAt)
 		const secondary = value(rate?.secondaryUsedPercent, rate?.secondaryResetAt)
-		return { primary, secondary, max: Math.max(primary, secondary) }
+		// Rank by window length, not slot: some plans put the weekly window in
+		// primary. Without lengths, codex's default (secondary = longer) applies.
+		const primaryIsLonger =
+			(rate?.primaryWindowMinutes ?? 0) > (rate?.secondaryWindowMinutes ?? 0)
+		return {
+			long: primaryIsLonger ? primary : secondary,
+			short: primaryIsLonger ? secondary : primary,
+			max: Math.max(primary, secondary),
+		}
 	}
 	const inReserve = (account: PoolAccount): boolean =>
 		reservePercent < 100 && utilization(account).max >= reservePercent
@@ -938,12 +948,12 @@ export const createOpenAIPool = async (
 		for (const account of accounts) {
 			if (!available(account) || exclude?.has(account)) continue
 			const usage = utilization(account)
-			// Reserve tier first, then weighted load, then weekly then 5h headroom.
+			// Reserve tier first, then weighted load, then long then short window headroom.
 			const key = [
 				inReserve(account) ? 1 : 0,
 				weightedLoad(account.inflight, account.weight),
-				usage.secondary,
-				usage.primary,
+				usage.long,
+				usage.short,
 			]
 			const index = key.findIndex((value, at) => value !== bestKey[at])
 			if (!best || (index >= 0 && (key[index] ?? 0) < (bestKey[index] ?? 0))) {
