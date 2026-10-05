@@ -1,3 +1,4 @@
+import { InferenceError } from "@openai-oauth/core"
 import { describe, expect, it } from "vitest"
 import {
 	buildWebsocketUpgradeHeaders,
@@ -325,6 +326,89 @@ describe("websocket transport", () => {
 		await clock.tick(0)
 		FakeWebSocket.instances[0].emit("error")
 		await assertion
+		await transport.close()
+	})
+
+	it("turns a rejected upgrade into a throttled error carrying Retry-After", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock()
+		await clock.tick(1_000_000)
+		let reject: ((status: number, headers: Headers) => void) | undefined
+		const transport = makeTestTransport(clock, {
+			webSocketFactory: (url, values, _cookies, onRejected) => {
+				reject = onRejected
+				return new FakeWebSocket(url, values) as never
+			},
+		} as never)
+		const pending = transport
+			.streamResponse({ model: "gpt-5" }, identity, ACCESS_TOKEN)
+			.catch((caught: unknown) => caught)
+		await clock.tick(0)
+		reject?.(429, new Headers({ "retry-after": "30" }))
+		FakeWebSocket.instances[0].emit("error")
+		const error = await pending
+		expect(error).toBeInstanceOf(InferenceError)
+		expect(error).toMatchObject({
+			category: "throttled",
+			status: 429,
+			responseStarted: false,
+			retryAt: 1_030_000,
+		})
+		await transport.close()
+	})
+
+	it("extends a rejected upgrade's retry to a saturated window reset", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock()
+		await clock.tick(1_000_000)
+		let reject: ((status: number, headers: Headers) => void) | undefined
+		const transport = makeTestTransport(clock, {
+			webSocketFactory: (url, values, _cookies, onRejected) => {
+				reject = onRejected
+				return new FakeWebSocket(url, values) as never
+			},
+		} as never)
+		const pending = transport
+			.streamResponse({ model: "gpt-5" }, identity, ACCESS_TOKEN)
+			.catch((caught: unknown) => caught)
+		await clock.tick(0)
+		reject?.(
+			429,
+			new Headers({
+				"x-codex-secondary-used-percent": "100",
+				"x-codex-secondary-reset-at": "5000",
+			}),
+		)
+		FakeWebSocket.instances[0].emit("close")
+		const error = await pending
+		expect(error).toMatchObject({ category: "throttled", retryAt: 5_000_000 })
+		await transport.close()
+	})
+
+	it("serializes response.create with codex routing fields first", async () => {
+		FakeWebSocket.instances = []
+		const clock = createVirtualClock()
+		const transport = makeTestTransport(clock)
+		const streamPromise = transport.streamResponse(
+			{
+				input: [{ type: "message", content: "hi" }],
+				instructions: "Use the available tools.",
+				service_tier: "priority",
+				model: "gpt-test",
+			},
+			identity,
+			ACCESS_TOKEN,
+		)
+		await clock.tick(0)
+		const socket = FakeWebSocket.instances[0]
+		socket.open()
+		await clock.tick(0)
+		expect(socket.sent[0]).toMatch(
+			/^\{"type":"response\.create","model":"gpt-test","stream":true,"service_tier":"priority","instructions":"Use the available tools\.","input":/,
+		)
+		completeResponse(socket)
+		await clock.tick(0)
+		await readStreamText(await streamPromise)
 		await transport.close()
 	})
 

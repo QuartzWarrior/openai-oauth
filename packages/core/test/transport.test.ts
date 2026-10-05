@@ -212,6 +212,31 @@ describe("createCodexOAuthFetch", () => {
 		expect(body.max_output_tokens).toBeUndefined()
 	})
 
+	test("serializes codex routing fields before the input", async () => {
+		const fetch = createMockFetch()
+		const oauthFetch = createCodexOAuthFetch({ auth: session, fetch })
+		await oauthFetch("https://example.test/v1/responses", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				input: "Hello",
+				metadata: { caller: "kept" },
+				service_tier: "priority",
+				model: "gpt-5.2",
+			}),
+		})
+		const [, init] = upstreamCalls(fetch)[0] ?? []
+		const keys = Object.keys(JSON.parse(String(init?.body)))
+		expect(keys.slice(0, 4)).toEqual([
+			"model",
+			"stream",
+			"service_tier",
+			"instructions",
+		])
+		expect(keys.indexOf("input")).toBeLessThan(keys.indexOf("include"))
+		expect(keys.at(-1)).toBe("metadata")
+	})
+
 	test("bridges non-streaming OpenAI requests over the required SSE transport", async () => {
 		const fetch = createMockFetch(
 			async () =>

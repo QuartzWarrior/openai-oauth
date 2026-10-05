@@ -375,3 +375,44 @@ describe("stream deadlines and completion seams", () => {
 		).toBe("throttled")
 	})
 })
+
+describe("upstream codex 0.160 error parity", () => {
+	test("reads Retry-After from response.failed error.headers", () => {
+		const error = parseInferenceError(
+			{
+				type: "response.failed",
+				response: {
+					error: {
+						code: "server_is_overloaded",
+						headers: { "Retry-After": "12", "x-secret": "dropped" },
+					},
+				},
+			},
+			{ now: 1_000 },
+		)
+		expect(error).toMatchObject({ category: "overloaded", retryAt: 13_000 })
+		// Transport headers, when present, remain authoritative.
+		expect(
+			parseInferenceError(
+				{
+					error: {
+						code: "rate_limit_exceeded",
+						headers: { "retry-after": "99" },
+					},
+				},
+				{ now: 0, headers: new Headers({ "retry-after": "1" }) },
+			).retryAt,
+		).toBe(1_000)
+	})
+
+	test("classifies a content_filter incomplete response as request-scoped", () => {
+		const error = parseInferenceError({
+			type: "response.incomplete",
+			response: {
+				status: "incomplete",
+				incomplete_details: { reason: "content_filter" },
+			},
+		})
+		expect(error).toMatchObject({ category: "request", code: "content_filter" })
+	})
+})

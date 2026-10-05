@@ -30,6 +30,11 @@ export async function load(url, context, next) {
     format: 'module', shortCircuit: true,
     source: \`export async function createOpenAIPool(options) {
       if (String(options.healthRefreshMs) !== process.env.EXPECTED_HEALTH_REFRESH) throw new Error('Health refresh was not forwarded')
+      if (process.env.EXPECTED_USAGE_OPTIONS !== undefined) {
+        const { startupProbeWindowMs, blockedProbeMs, usageReservePercent, failoverOnUsageLimit } = options
+        const actual = JSON.stringify({ startupProbeWindowMs, blockedProbeMs, usageReservePercent, failoverOnUsageLimit })
+        if (actual !== process.env.EXPECTED_USAGE_OPTIONS) throw new Error('Usage options were not forwarded: ' + actual)
+      }
       return {
         calls: { stats: 0, catalog: 0 },
         stats() {
@@ -70,7 +75,7 @@ export async function load(url, context, next) {
 }
 `,
 		)
-	const runConfig = (overrides = {}, environment = {}, args = []) => {
+		const runConfig = (overrides = {}, environment = {}, args = []) => {
 			const configPath = path.join(directory, "config.json")
 			writeFileSync(
 				configPath,
@@ -86,6 +91,9 @@ export async function load(url, context, next) {
 			delete env.EXPECTED_RUNNER_TOKEN
 			delete env.EXPECTED_RUNNER_DIAGNOSTICS
 			delete env.EXPECTED_HEALTH_REFRESH
+			delete env.EXPECTED_USAGE_OPTIONS
+			if (environment.EXPECTED_USAGE_OPTIONS !== undefined)
+				env.EXPECTED_USAGE_OPTIONS = environment.EXPECTED_USAGE_OPTIONS
 			env.EXPECTED_HEALTH_REFRESH = "undefined"
 			if (environment.EXPECTED_RUNNER_DIAGNOSTICS)
 				env.EXPECTED_RUNNER_DIAGNOSTICS =
@@ -158,7 +166,44 @@ for (const healthRefreshMs of [false, 0, -1, 1.5, "60000", null]) {
 		withFixture((run) => {
 			const result = run({ healthRefreshMs })
 			assert.equal(result.status, 1)
-			assert.match(result.stderr, /healthRefreshMs must be true or a positive integer/)
+			assert.match(
+				result.stderr,
+				/healthRefreshMs must be true or a positive integer/,
+			)
+		}))
+}
+
+test("runner forwards usage-aware routing options", () =>
+	withFixture((run) => {
+		const usage = {
+			startupProbeWindowMs: false,
+			blockedProbeMs: 1_800_000,
+			usageReservePercent: 90,
+			failoverOnUsageLimit: false,
+		}
+		const result = run(usage, {
+			EXPECTED_USAGE_OPTIONS: JSON.stringify(usage),
+		})
+		assert.equal(result.status, 0, result.stderr)
+		assert.match(result.stdout, /runner-options-verified/)
+	}))
+
+for (const [field, value, message] of [
+	["blockedProbeMs", 0, /blockedProbeMs must be false or a positive integer/],
+	[
+		"startupProbeWindowMs",
+		true,
+		/startupProbeWindowMs must be false or a positive integer/,
+	],
+	["usageReservePercent", 101, /usageReservePercent must be a number/],
+	["usageReservePercent", 0, /usageReservePercent must be a number/],
+	["failoverOnUsageLimit", "yes", /failoverOnUsageLimit must be true or false/],
+]) {
+	test(`runner rejects invalid ${field} ${JSON.stringify(value)}`, () =>
+		withFixture((run) => {
+			const result = run({ [field]: value })
+			assert.equal(result.status, 1)
+			assert.match(result.stderr, message)
 		}))
 }
 

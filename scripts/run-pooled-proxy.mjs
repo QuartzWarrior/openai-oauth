@@ -43,12 +43,29 @@ const readBoolean = (value, field) => {
 const readHealthRefreshMs = (value) => {
 	if (value === undefined) return undefined
 	if (value === true) return true
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+		throw new Error("healthRefreshMs must be true or a positive integer.")
+	}
+	return value
+}
+
+const readProbeMs = (value, field) => {
+	if (value === undefined || value === false) return value
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+		throw new Error(`${field} must be false or a positive integer.`)
+	}
+	return value
+}
+
+const readReservePercent = (value) => {
+	if (value === undefined) return undefined
 	if (
 		typeof value !== "number" ||
-		!Number.isSafeInteger(value) ||
-		value <= 0
+		!Number.isFinite(value) ||
+		value <= 0 ||
+		value > 100
 	) {
-		throw new Error("healthRefreshMs must be true or a positive integer.")
+		throw new Error("usageReservePercent must be a number in (0, 100].")
 	}
 	return value
 }
@@ -252,6 +269,16 @@ const parseConfig = async (configPath) => {
 		accessToken,
 		diagnostics: readBoolean(parsed.diagnostics, "diagnostics") ?? false,
 		healthRefreshMs: readHealthRefreshMs(parsed.healthRefreshMs),
+		startupProbeWindowMs: readProbeMs(
+			parsed.startupProbeWindowMs,
+			"startupProbeWindowMs",
+		),
+		blockedProbeMs: readProbeMs(parsed.blockedProbeMs, "blockedProbeMs"),
+		usageReservePercent: readReservePercent(parsed.usageReservePercent),
+		failoverOnUsageLimit: readBoolean(
+			parsed.failoverOnUsageLimit,
+			"failoverOnUsageLimit",
+		),
 		host: readString(parsed.host, "host", true) ?? "127.0.0.1",
 		models: readModels(parsed.models),
 		port: parsed.port === undefined ? 10531 : readPort(parsed.port),
@@ -294,6 +321,10 @@ const main = async () => {
 	const pool = await createOpenAIPool({
 		accounts: config.accounts,
 		healthRefreshMs: config.healthRefreshMs,
+		startupProbeWindowMs: config.startupProbeWindowMs,
+		blockedProbeMs: config.blockedProbeMs,
+		usageReservePercent: config.usageReservePercent,
+		failoverOnUsageLimit: config.failoverOnUsageLimit,
 		retryOnOtherAccount: config.retryOnOtherAccount,
 		rotateIdentity: config.rotateIdentity,
 	})

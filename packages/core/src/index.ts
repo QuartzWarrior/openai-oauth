@@ -7,6 +7,7 @@ export {
 } from "./context.js"
 export type { CodexImageLimits } from "./images.js"
 export {
+	codexPolicyHeaders,
 	InferenceError,
 	type InferenceErrorCategory,
 	type InferenceErrorOptions,
@@ -24,6 +25,7 @@ export {
 	selectCodexModels,
 } from "./models.js"
 export {
+	applyCodexAuthHeaders,
 	buildCodexUserAgent,
 	createOpenAIOAuthRequest,
 	createOpenAIOAuthTransport,
@@ -48,6 +50,7 @@ export {
 	type OpenAIOAuthTokenResponse,
 	type OpenAIOAuthTransport,
 	type OpenAIOAuthTransportOptions,
+	orderCodexRequestFields,
 	parseJwtClaims,
 	pickCodexTerminalToken,
 	type ResponsesContext,

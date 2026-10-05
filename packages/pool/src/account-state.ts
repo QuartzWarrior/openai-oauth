@@ -166,6 +166,39 @@ const extractErrorFields = (
 }
 
 /**
+ * Delay until the latest saturated (>= 100%) rate window resets, read from
+ * the active limit's headers when `x-codex-active-limit` names one.
+ * reset-at is explicitly Unix seconds in the upstream rate-limit protocol.
+ * Only a saturated window with a future reset can lengthen a cooldown.
+ */
+export const saturatedResetDelay = (
+	headers: Headers | undefined,
+	now: number,
+): number | undefined => {
+	if (!headers) return undefined
+	const active = headers.get("x-codex-active-limit")
+	const activeHeaders = new Headers(headers)
+	if (active && /^[a-z0-9_-]{1,64}$/i.test(active)) {
+		for (const window of ["primary", "secondary"])
+			for (const field of ["used-percent", "reset-at", "window-minutes"]) {
+				const value = headers.get(`x-codex-${active}-${window}-${field}`)
+				if (value !== null)
+					activeHeaders.set(`x-codex-${window}-${field}`, value)
+			}
+	}
+	const snapshot = parseCodexRateHeaders(activeHeaders, now)
+	const resets = [
+		(snapshot?.primaryUsedPercent ?? 0) >= 100
+			? snapshot?.primaryResetAt
+			: undefined,
+		(snapshot?.secondaryUsedPercent ?? 0) >= 100
+			? snapshot?.secondaryResetAt
+			: undefined,
+	].filter((value): value is number => value !== undefined && value > now)
+	return resets.length > 0 ? Math.max(...resets) - now : undefined
+}
+
+/**
  * Decides how long an account should sit out of rotation after a failed
  * response, and whether the same request is safe to replay on another
  * account. Honors `Retry-After` when present; otherwise backs off
@@ -199,30 +232,7 @@ export const computeUnavailability = (input: {
 		MAX_BACKOFF_MS,
 		BASE_BACKOFF_MS * 2 ** Math.min(consecutiveFailures, 4),
 	)
-	// reset-at is explicitly Unix seconds in the upstream rate-limit protocol.
-	// Only a saturated window with a future reset can lengthen its cooldown.
-	const active = input.headers?.get("x-codex-active-limit")
-	const activeHeaders = input.headers ? new Headers(input.headers) : undefined
-	if (active && /^[a-z0-9_-]{1,64}$/i.test(active) && activeHeaders) {
-		for (const window of ["primary", "secondary"])
-			for (const field of ["used-percent", "reset-at", "window-minutes"]) {
-				const value = activeHeaders.get(`x-codex-${active}-${window}-${field}`)
-				if (value !== null)
-					activeHeaders.set(`x-codex-${window}-${field}`, value)
-			}
-	}
-	const snapshot = activeHeaders
-		? parseCodexRateHeaders(activeHeaders, now)
-		: undefined
-	const resets = [
-		(snapshot?.primaryUsedPercent ?? 0) >= 100
-			? snapshot?.primaryResetAt
-			: undefined,
-		(snapshot?.secondaryUsedPercent ?? 0) >= 100
-			? snapshot?.secondaryResetAt
-			: undefined,
-	].filter((value): value is number => value !== undefined && value > now)
-	const resetDelay = resets.length > 0 ? Math.max(...resets) - now : undefined
+	const resetDelay = saturatedResetDelay(input.headers, now)
 	const unavailableMs = Math.max(
 		retryAfterMs ?? backoffMs,
 		isRateLimit

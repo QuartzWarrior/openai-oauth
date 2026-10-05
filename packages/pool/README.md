@@ -48,7 +48,7 @@ await pool.destroy();
 - Each configured account has separate credential loading, response state and HTTP transport resources. HTTP, WebSocket and public session loading share the account's credential-loading primitive.
 - A predecessor response ID binds a continuation to its recorded owner, even when the new input differs. Identical-request affinity is a scheduling optimization, not proof of conversation ownership.
 - Unknown/expired ownership fails explicitly. Removing an unknown `previous_response_id` does **not** reconstruct history.
-- Quota/authentication failures are returned rather than retried under another account. `retryOnOtherAccount` is retained as a deprecated compatibility option; it does not enable quota failover.
+- A **fresh** request (no `previous_response_id`, no owned `x-pool-conversation-id`, no item references) that fails with a 429 or an account-scoped quota error before any output is replayed on another account (`failoverOnUsageLimit`, default `true`). Bound continuations never move: their quota/authentication failures are returned. When every account has been tried, the last upstream error is returned unchanged. `retryOnOtherAccount` remains a deprecated no-op.
 - No migration clears another account's response cache. To begin an independent request, supply complete authorized input without a predecessor ID.
 - Pool ownership indexes and core response caches are bounded and in-memory. Restart or eviction can make an old continuation unavailable.
 
@@ -98,12 +98,28 @@ The scheduler uses weighted in-flight load and health observations. In-flight in
 | `queueTimeoutMs` | 300000 | Maximum admission wait |
 | `maxRequestBodyBytes` | 8388608 | Maximum body inspected by the pool |
 | `healthRefreshMs` | disabled | `true` probes every 60 seconds; a positive integer sets the interval |
+| `startupProbeWindowMs` | 120000 | One `/wham/usage` probe per account at a random offset in this window; `false` skips |
+| `blockedProbeMs` | 3600000 | Re-probe cadence (±20%) for usage-blocked accounts; `false` disables |
+| `usageReservePercent` | 95 | Accounts at/above this used % are picked only when nothing below it is free; `100` disables |
+| `failoverOnUsageLimit` | `true` | Replay fresh requests on another account after a 429/quota error |
 
 A `flex_unavailable` 429 is service-wide Flex capacity, so it fails the request without cooling the account (core reports it as the `capacity` category).
 
 These local limits do not grant upstream quota. `Retry-After` is honored; a rate window's length is not treated as its remaining reset time. Utilization observations have their own freshness and are not reset deadlines. A synthetic concurrent test is not a production-throughput benchmark.
 
 `pool.stats()` exposes account name/ID, installation ID, selected transport, health, in-flight count, cooldown and observed rate metadata. Do not expose those details to unauthorized callers.
+
+## Usage-aware routing
+
+The pool avoids sending requests into exhausted plan limits:
+
+- **Observation.** Healthy and near-limit accounts are never polled. Their 5h (primary) and weekly (secondary) usage comes from `x-codex-*` response headers and `codex.rate_limits` events on real requests. A value stays valid until its window's reset time.
+- **Startup.** Each account gets one authenticated `GET backend-api/wham/usage` probe, the same endpoint codex uses, at an independent random offset inside `startupProbeWindowMs`.
+- **Blocking.** An account is excluded when its usage shows `allowed: false`, `limit_reached`, spend control reached, or a window at 100% with no credits to fall back on. A 429 `usage_limit_reached` blocks it too. It stays excluded until the saturated window's reset; at a known reset it is re-admitted without a probe. A blocked account is re-probed every `blockedProbeMs` (±20%), which catches early unblocks and unknown reset times.
+- **Reserve.** Accounts at or above `usageReservePercent` on either window are chosen only when no account below it is available. Within a tier the order is weighted load, then weekly headroom, then 5h headroom. Identical-request affinity is ignored for reserve accounts; response-ID owners stay binding.
+- **Decorrelated probes.** Every account has its own timer, with no shared tick, and a pool-wide slot keeps any two probes at least 3–10 s apart (randomized). Each probe uses that account's proxy route, cookie jar and user agent. Timing alone does not hide a shared egress IP; configure per-account `proxy` for that.
+
+Probe 429s, server errors and malformed payloads never bench an account; only an authentication rejection does. A probe answered after the credential owner changed is discarded. `pool.stats()[i].usage` reports `blocked`, `blockedReason`, `blockedUntil`, `reserve`, `nextProbeAt`, `observedAt` and `source`.
 
 ## Quota diagnostics
 

@@ -692,12 +692,13 @@ describe("createOpenAIPool", () => {
 		await pool.destroy()
 	})
 
-	it("returns quota errors without replay and skips cooling accounts for new requests", async () => {
+	it("returns quota errors without replay when failover is disabled and skips cooling accounts", async () => {
 		stubModelCatalog()
 		const responsesCalls = { a: 0, b: 0 }
 
 		const pool = await createOpenAIPool({
 			codexVersion: TEST_CODEX_VERSION,
+			failoverOnUsageLimit: false,
 			accounts: [
 				{
 					authFilePath: makeAuthFile({ accountId: "acct-a" }),
@@ -829,6 +830,7 @@ describe("createOpenAIPool", () => {
 		}) as typeof fetch
 		const pool = await createOpenAIPool({
 			codexVersion: TEST_CODEX_VERSION,
+			failoverOnUsageLimit: false,
 			queueTimeoutMs: 60_000,
 			accounts: [
 				{ authFilePath: makeAuthFile({ accountId: "acct-a" }), fetch: limited },
@@ -893,6 +895,7 @@ describe("createOpenAIPool", () => {
 
 		const pool = await createOpenAIPool({
 			codexVersion: TEST_CODEX_VERSION,
+			failoverOnUsageLimit: false,
 			accounts: [
 				{
 					authFilePath: makeAuthFile({ accountId: "acct-a" }),

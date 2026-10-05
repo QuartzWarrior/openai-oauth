@@ -3,6 +3,10 @@
 	"port": 10531,
 	"diagnostics": false,
 	"healthRefreshMs": true,
+	"startupProbeWindowMs": 120000,
+	"blockedProbeMs": 3600000,
+	"usageReservePercent": 95,
+	"failoverOnUsageLimit": true,
 	"retryOnOtherAccount": false,
 	"accounts": [
 		{

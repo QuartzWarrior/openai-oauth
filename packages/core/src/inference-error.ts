@@ -49,6 +49,7 @@ const codes = new Set([
 	"insufficient_permissions",
 	"invalid_prompt",
 	"bio_policy",
+	"content_filter",
 ])
 const identifier = (value: unknown): string | undefined =>
 	typeof value === "string" &&
@@ -57,6 +58,31 @@ const identifier = (value: unknown): string | undefined =>
 	/^[A-Za-z0-9_.:-]+$/.test(value)
 		? value
 		: undefined
+
+const POLICY_HEADERS = ["retry-after", "x-codex-active-limit", "x-request-id"]
+
+/**
+ * Bounded HTTP policy metadata carried inside an error body (wrapped WebSocket
+ * error frames and `response.failed` `error.headers`), never arbitrary headers.
+ */
+export const codexPolicyHeaders = (value: unknown): Headers => {
+	const headers = new Headers()
+	if (!isRecord(value)) return headers
+	for (const [name, raw] of Object.entries(value)) {
+		const key = name.toLowerCase()
+		if (!POLICY_HEADERS.includes(key)) continue
+		const text =
+			typeof raw === "string"
+				? raw
+				: typeof raw === "number" && Number.isFinite(raw)
+					? String(raw)
+					: undefined
+		if (text === undefined || text.length > 256 || /[^\x20-\x7e]/.test(text))
+			continue
+		headers.set(key, text)
+	}
+	return headers
+}
 
 /** Machine-readable failure with no provider message, tokens or raw error cause. */
 export class InferenceError extends Error {
@@ -108,7 +134,23 @@ export const parseInferenceError = (
 				: typeof root.error === "string"
 					? root.error
 					: undefined
-	const code = candidate && codes.has(candidate) ? candidate : undefined
+	// codex sse/responses.rs: `response.incomplete` with reason content_filter
+	// is a distinct, request-scoped failure (ApiError::ContentFilter).
+	const incomplete = isRecord(response.incomplete_details)
+		? response.incomplete_details.reason
+		: undefined
+	const code =
+		candidate && codes.has(candidate)
+			? candidate
+			: incomplete === "content_filter"
+				? "content_filter"
+				: undefined
+	// codex sse/responses_error.rs reads Retry-After from `error.headers` when
+	// the failure arrives in-stream without transport headers.
+	const embedded = isRecord(error.headers) ? error.headers : root.headers
+	const headers =
+		options.headers ??
+		(isRecord(embedded) ? codexPolicyHeaders(embedded) : undefined)
 	const rawStatus =
 		options.status ?? error.status ?? root.status ?? root.status_code
 	const status =
@@ -171,6 +213,7 @@ export const parseInferenceError = (
 			"insufficient_permissions",
 			"invalid_prompt",
 			"bio_policy",
+			"content_filter",
 		].includes(code ?? "") ||
 		status === 400 ||
 		status === 403 ||
@@ -189,7 +232,7 @@ export const parseInferenceError = (
 		Number.isSafeInteger(reset * 1000)
 	)
 		retryAt = reset * 1000
-	const retry = options.headers?.get("retry-after")
+	const retry = headers?.get("retry-after")
 	if (retry) {
 		const numeric = Number(retry)
 		const candidateAt =
@@ -205,13 +248,9 @@ export const parseInferenceError = (
 		code,
 		retryAt,
 		limitId: identifier(
-			error.limit_id ??
-				root.limit_id ??
-				options.headers?.get("x-codex-active-limit"),
+			error.limit_id ?? root.limit_id ?? headers?.get("x-codex-active-limit"),
 		),
-		requestId: identifier(
-			root.request_id ?? options.headers?.get("x-request-id"),
-		),
+		requestId: identifier(root.request_id ?? headers?.get("x-request-id")),
 		responseStarted: options.responseStarted,
 	})
 }

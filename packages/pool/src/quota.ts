@@ -296,3 +296,186 @@ export class QuotaStore {
 		}
 	}
 }
+
+export type CodexUsageWindow = {
+	usedPercent: number
+	windowMinutes?: number
+	/** Unix epoch milliseconds. */
+	resetAt?: number
+}
+/** Authoritative account usage read from codex's `/wham/usage` endpoint. */
+export type CodexUsageSnapshot = {
+	observedAt: number
+	/** `rate_limit.allowed`: whether ordinary plan usage may continue. */
+	allowed?: boolean
+	limitReached?: boolean
+	primary?: CodexUsageWindow
+	secondary?: CodexUsageWindow
+	credits?: { hasCredits?: boolean; unlimited?: boolean; balance?: string }
+	spendControlReached?: boolean
+	reachedType?: string
+	planType?: string
+	/** The same observation as bounded diagnostic quota updates. */
+	updates: CodexQuotaUpdate[]
+}
+
+const usageWindow = (
+	value: unknown,
+	observedAt: number,
+): CodexUsageWindow | undefined => {
+	if (!isRecord(value)) return undefined
+	const used = number(value.used_percent)
+	if (used === undefined) return undefined
+	const window: CodexUsageWindow = { usedPercent: used }
+	const seconds = number(value.limit_window_seconds)
+	if (seconds !== undefined && Number.isSafeInteger(seconds))
+		window.windowMinutes = Math.ceil(seconds / 60)
+	const resetAt = number(value.reset_at)
+	const resetAfter = number(value.reset_after_seconds)
+	if (
+		resetAt !== undefined &&
+		resetAt > 0 &&
+		Number.isSafeInteger(resetAt * 1000)
+	)
+		window.resetAt = resetAt * 1000
+	else if (
+		resetAfter !== undefined &&
+		Number.isSafeInteger(observedAt + resetAfter * 1000)
+	)
+		window.resetAt = observedAt + resetAfter * 1000
+	return window
+}
+
+const quotaWindowUpdate = (
+	window: CodexUsageWindow | undefined,
+): CodexQuotaUpdate["primary"] =>
+	window && {
+		usedPercent: window.usedPercent,
+		windowMinutes: window.windowMinutes,
+		resetAt: window.resetAt,
+	}
+
+/**
+ * Parses the `GET backend-api/wham/usage` payload (codex backend-client
+ * RateLimitStatusPayload). Unknown or malformed fields are omitted.
+ */
+export const parseCodexUsagePayload = (
+	payload: unknown,
+	observedAt = Date.now(),
+): CodexUsageSnapshot | undefined => {
+	if (!isRecord(payload) || !validTime(observedAt)) return undefined
+	const rate = isRecord(payload.rate_limit) ? payload.rate_limit : undefined
+	const snapshot: CodexUsageSnapshot = { observedAt, updates: [] }
+	const allowed = boolean(rate?.allowed)
+	const limitReached = boolean(rate?.limit_reached)
+	if (allowed !== undefined) snapshot.allowed = allowed
+	if (limitReached !== undefined) snapshot.limitReached = limitReached
+	snapshot.primary = usageWindow(rate?.primary_window, observedAt)
+	snapshot.secondary = usageWindow(rate?.secondary_window, observedAt)
+	const credits = creditsUpdate(payload.credits)
+	if (credits) snapshot.credits = credits
+	const spend = isRecord(payload.spend_control)
+		? boolean(payload.spend_control.reached)
+		: undefined
+	if (spend !== undefined) snapshot.spendControlReached = spend
+	const reached = isRecord(payload.rate_limit_reached_type)
+		? limitId(payload.rate_limit_reached_type.type)
+		: undefined
+	if (reached) snapshot.reachedType = reached
+	const plan = boundedText(payload.plan_type)
+	if (plan) snapshot.planType = plan
+	if (snapshot.primary || snapshot.secondary || credits)
+		snapshot.updates.push({
+			limitId: "codex",
+			observedAt,
+			planType: plan,
+			primary: quotaWindowUpdate(snapshot.primary),
+			secondary: quotaWindowUpdate(snapshot.secondary),
+			credits,
+		})
+	const additional = Array.isArray(payload.additional_rate_limits)
+		? payload.additional_rate_limits.slice(0, MAX_FAMILIES - 1)
+		: []
+	for (const entry of additional) {
+		if (!isRecord(entry)) continue
+		const id = limitId(entry.metered_feature)
+		const details = isRecord(entry.rate_limit) ? entry.rate_limit : undefined
+		if (!id || id === "codex" || !details) continue
+		const primary = usageWindow(details.primary_window, observedAt)
+		const secondary = usageWindow(details.secondary_window, observedAt)
+		if (!primary && !secondary) continue
+		snapshot.updates.push({
+			limitId: id,
+			observedAt,
+			limitName: boundedText(entry.limit_name),
+			planType: plan,
+			primary: quotaWindowUpdate(primary),
+			secondary: quotaWindowUpdate(secondary),
+		})
+	}
+	return snapshot
+}
+
+const BLOCKING_REACHED_TYPES = new Set([
+	"rate_limit_reached",
+	"workspace_owner_credits_depleted",
+	"workspace_member_credits_depleted",
+	"workspace_owner_usage_limit_reached",
+	"workspace_member_usage_limit_reached",
+])
+
+export type UsageBlock = {
+	/** Latest known reset of a saturated window; undefined when unknown. */
+	until?: number
+	reason: string
+}
+
+/**
+ * Decides whether an account's plan usage is exhausted. Saturated windows are
+ * bypassed when the account can continue on credits, matching codex's
+ * credit fallback; an explicit `allowed: false` always blocks.
+ */
+export const evaluateUsageBlock = (
+	usage: Pick<
+		CodexUsageSnapshot,
+		| "allowed"
+		| "limitReached"
+		| "primary"
+		| "secondary"
+		| "credits"
+		| "spendControlReached"
+		| "reachedType"
+	>,
+	now: number,
+): UsageBlock | undefined => {
+	const onCredits =
+		usage.credits?.unlimited === true || usage.credits?.hasCredits === true
+	const saturated = (
+		[
+			["weekly", usage.secondary],
+			["5h", usage.primary],
+		] as const
+	).filter(
+		([, window]) =>
+			window !== undefined &&
+			window.usedPercent >= 100 &&
+			(window.resetAt === undefined || window.resetAt > now),
+	)
+	const explicit =
+		usage.allowed === false ||
+		usage.spendControlReached === true ||
+		(usage.reachedType !== undefined &&
+			BLOCKING_REACHED_TYPES.has(usage.reachedType) &&
+			usage.allowed !== true)
+	const reachedOnLimit = usage.limitReached === true && !onCredits
+	if (!explicit && !reachedOnLimit && (saturated.length === 0 || onCredits))
+		return undefined
+	const resets = saturated
+		.map(([, window]) => window?.resetAt)
+		.filter((value): value is number => value !== undefined)
+	const name = saturated[0]?.[0]
+	return {
+		until: resets.length > 0 ? Math.max(...resets) : undefined,
+		reason: `usage limit reached${name ? ` (${name})` : ""}`,
+	}
+}

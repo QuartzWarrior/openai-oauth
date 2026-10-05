@@ -20,6 +20,7 @@ export type PoolDiagnosticsSource = {
 		cooldownRemainingMs: number
 		consecutiveFailures: number
 		quota?: unknown
+		usage?: unknown
 	}[]
 	getModelCatalog(
 		accountName: string,
@@ -206,6 +207,14 @@ export const handlePoolDiagnosticsRequest = async (
 						["healthy"],
 					),
 					quota: quotaSummary(entry.quota),
+					usage: isRecord(entry.usage)
+						? scalarFields(
+								entry.usage,
+								["blockedReason", "source"],
+								["blockedUntil", "nextProbeAt", "observedAt"],
+								["blocked", "reserve"],
+							)
+						: undefined,
 				})),
 			})
 		}

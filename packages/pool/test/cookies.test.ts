@@ -244,6 +244,47 @@ describe("websocket handshake cookies", () => {
 	})
 })
 
+describe("handshake rejection observation", () => {
+	it("reports a rejected undici upgrade's status and policy headers only", async () => {
+		const undici = await import("undici")
+		const server = createServer()
+		server.on("upgrade", (_request, socket) => {
+			socket.end(
+				"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\nX-Codex-Secondary-Used-Percent: 100\r\nX-Secret: hidden\r\nContent-Length: 0\r\n\r\n",
+			)
+		})
+		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+		const { port } = server.address() as AddressInfo
+		const rejected: Array<{ status: number; headers: Headers }> = []
+		const dispatcher = undici.getGlobalDispatcher().compose(
+			observeHandshakeCookies(
+				() => undefined,
+				(status, headers) => rejected.push({ status, headers }),
+			) as unknown as Parameters<
+				ReturnType<typeof undici.getGlobalDispatcher>["compose"]
+			>[0],
+		)
+		try {
+			await new Promise<void>((resolve) => {
+				const socket = new undici.WebSocket(`ws://127.0.0.1:${port}/`, {
+					dispatcher,
+				})
+				socket.addEventListener("error", () => resolve())
+				socket.addEventListener("close", () => resolve())
+			})
+		} finally {
+			server.closeAllConnections()
+			server.close()
+		}
+		expect(rejected).toHaveLength(1)
+		expect(rejected[0]?.status).toBe(429)
+		expect(Object.fromEntries(rejected[0]?.headers ?? [])).toEqual({
+			"retry-after": "120",
+			"x-codex-secondary-used-percent": "100",
+		})
+	})
+})
+
 describe("pool cookie isolation", () => {
 	it("keeps each account's infrastructure cookies to that account", async () => {
 		globalThis.fetch = (async () =>

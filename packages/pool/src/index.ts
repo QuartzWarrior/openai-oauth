@@ -15,15 +15,22 @@ export type {
 	PoolAccountStats,
 	PoolConfig,
 	PoolModelCatalogSnapshot,
+	PoolUsageStats,
 } from "./pool.js"
 export { createOpenAIPool } from "./pool.js"
 export type {
 	CodexQuotaUpdate,
+	CodexUsageSnapshot,
+	CodexUsageWindow,
 	PoolQuotaStats,
 	QuotaCredits,
 	QuotaFamily,
 	QuotaWindow,
 } from "./quota.js"
-export { parseCodexQuotaEvent, parseCodexQuotaHeaders } from "./quota.js"
+export {
+	parseCodexQuotaEvent,
+	parseCodexQuotaHeaders,
+	parseCodexUsagePayload,
+} from "./quota.js"
 export type { ReplayMapOptions } from "./session-hash.js"
 export { computeSessionHash, ReplayMap } from "./session-hash.js"

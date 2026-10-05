@@ -28,15 +28,17 @@ import {
 	computeUnavailability,
 	isAccountAvailable,
 	parseCodexRateHeaders,
-	rateSnapshotUtilization,
 } from "./account-state.js"
 import { ChatGptCookieJar, withChatGptCookies } from "./cookie-jar.js"
 import { weightedLoad } from "./inflight-tracker.js"
 import {
+	type CodexUsageSnapshot,
+	evaluateUsageBlock,
 	type PoolQuotaStats,
 	parseCodexQuotaEvent,
 	parseCodexQuotaHeaders,
 	QuotaStore,
+	type UsageBlock,
 } from "./quota.js"
 import { observeResponse } from "./response-id.js"
 import {
@@ -49,6 +51,11 @@ import {
 	ReplayMap,
 	type ReplayMapOptions,
 } from "./session-hash.js"
+import {
+	codexUsageUrl,
+	fetchCodexUsage,
+	UsageProbeScheduler,
+} from "./usage-probe.js"
 import {
 	createWebsocketTransport,
 	type WebsocketTransport,
@@ -104,6 +111,22 @@ export type PoolConfig = {
 	maxRequestBodyBytes?: number
 	/** Opt-in authenticated account health refresh; true means every 60 seconds. */
 	healthRefreshMs?: true | number
+	/**
+	 * Spread one `/wham/usage` probe per account over this startup window
+	 * (default 120 seconds); false skips startup probes.
+	 */
+	startupProbeWindowMs?: number | false
+	/** Re-probe cadence (±20%) for usage-blocked accounts (default 1 hour). */
+	blockedProbeMs?: number | false
+	/**
+	 * Accounts at or above this used percent on either window are only picked
+	 * when no account below it is available (default 95; 100 disables).
+	 */
+	usageReservePercent?: number
+	/** Replay fresh requests on another account after a quota/429 (default true). */
+	failoverOnUsageLimit?: boolean
+	/** Test hook for probe jitter. */
+	random?: () => number
 }
 
 export type PoolAccountStats = {
@@ -118,7 +141,22 @@ export type PoolAccountStats = {
 	codex?: CodexRateSnapshot
 	/** Bounded owner-scoped observations; named meters do not affect scheduling. */
 	quota?: PoolQuotaStats
+	usage: PoolUsageStats
 }
+
+export type PoolUsageStats = {
+	blocked: boolean
+	blockedReason?: string
+	/** Unix epoch ms of the saturated window's reset, when known. */
+	blockedUntil?: number
+	/** At or above `usageReservePercent`; only picked when nothing else is free. */
+	reserve: boolean
+	nextProbeAt?: number
+	observedAt?: number
+	source?: UsageSource
+}
+
+type UsageSource = "probe" | "headers" | "event" | "response"
 
 export type PoolModelCatalogSnapshot = CodexModelCatalogSnapshot & {
 	accountName: string
@@ -158,6 +196,20 @@ type PoolAccount = {
 	wsTransport?: WebsocketTransport
 	runtime: AccountRuntime
 	cookies: ChatGptCookieJar
+	usage: {
+		blocked: boolean
+		blockedUntil?: number
+		blockedReason?: string
+		observedAt?: number
+		source?: UsageSource
+	}
+	probe: {
+		url: string
+		fetch: FetchFunction
+		versionFetch: FetchFunction
+		headers?: Record<string, string>
+		terminalToken?: string
+	}
 }
 
 type Owner = {
@@ -291,6 +343,24 @@ export const createOpenAIPool = async (
 		(!Number.isSafeInteger(healthRefreshMs) || healthRefreshMs <= 0)
 	)
 		throw new Error("Invalid pool healthRefreshMs.")
+	const startupProbeWindowMs = config.startupProbeWindowMs ?? 120_000
+	const blockedProbeMs = config.blockedProbeMs ?? 3_600_000
+	for (const [name, value] of Object.entries({
+		startupProbeWindowMs,
+		blockedProbeMs,
+	}))
+		if (value !== false && (!Number.isSafeInteger(value) || value <= 0))
+			throw new Error(`Invalid pool ${name}.`)
+	const reservePercent = config.usageReservePercent ?? 95
+	if (
+		typeof reservePercent !== "number" ||
+		!Number.isFinite(reservePercent) ||
+		reservePercent <= 0 ||
+		reservePercent > 100
+	)
+		throw new Error("Invalid pool usageReservePercent.")
+	const failoverOnUsageLimit = config.failoverOnUsageLimit ?? true
+	let usageScheduler: UsageProbeScheduler<PoolAccount> | undefined
 	const owners = new ReplayMap<Owner>({ ...config.replay, now })
 	const affinity = new ReplayMap<PoolAccount>({ ...config.replay, now })
 	const conversations = new ReplayMap<Owner>({ ...config.replay, now })
@@ -394,6 +464,14 @@ export const createOpenAIPool = async (
 					wsTransport,
 					runtime,
 					cookies,
+					usage: { blocked: false },
+					probe: {
+						url: codexUsageUrl(accountConfig.baseURL ?? config.baseURL),
+						fetch: cookieFetch,
+						versionFetch: accountConfig.refreshFetch ?? runtime.fetch,
+						headers: accountConfig.headers,
+						terminalToken,
+					},
 				}
 				account.lockedGetSession = createLockedGetSession(
 					async () => {
@@ -410,6 +488,8 @@ export const createOpenAIPool = async (
 									(account.lastSession.isFedRamp === true))
 						) {
 							account.health = { unavailableUntil: 0, consecutiveFailures: 0 }
+							account.usage = { blocked: false }
+							usageScheduler?.cancel(account)
 							account.lastRate = undefined
 							account.quota.clear()
 							account.conversationIds.clear()
@@ -616,6 +696,18 @@ export const createOpenAIPool = async (
 			until,
 		)
 		account.health.unavailableReason = error.category
+		if (error.category === "quota")
+			blockUsage(
+				account,
+				{
+					until:
+						error.retryAt !== undefined && error.retryAt > now()
+							? error.retryAt
+							: undefined,
+					reason: `usage limit reached${error.code ? ` (${error.code})` : ""}`,
+				},
+				"response",
+			)
 	}
 	const recordRateEvent = (account: PoolAccount, event: JsonRecord) => {
 		const update = parseCodexQuotaEvent(event, now())
@@ -639,6 +731,7 @@ export const createOpenAIPool = async (
 		}
 		const snapshot = parseCodexRateHeaders(headers, now())
 		if (snapshot) account.lastRate = snapshot
+		observeUsage(account, "event")
 	}
 	const recordCatalogResponse = (
 		account: PoolAccount,
@@ -651,7 +744,9 @@ export const createOpenAIPool = async (
 		const rate = parseCodexRateHeaders(response.headers, now())
 		if (rate) account.lastRate = rate
 		if (response.ok) {
-			account.health = { unavailableUntil: 0, consecutiveFailures: 0 }
+			if (!account.usage.blocked)
+				account.health = { unavailableUntil: 0, consecutiveFailures: 0 }
+			if (rate) observeUsage(account, "headers")
 			return
 		}
 		const failure = computeUnavailability({
@@ -668,43 +763,221 @@ export const createOpenAIPool = async (
 		)
 		account.health.unavailableReason = failure.reason
 	}
+	const blockUsage = (
+		account: PoolAccount,
+		block: UsageBlock,
+		source: UsageSource,
+	): void => {
+		const until = block.until ?? now() + (blockedProbeMs || 3_600_000)
+		account.usage = {
+			blocked: true,
+			blockedUntil: block.until,
+			blockedReason: block.reason,
+			observedAt: now(),
+			source,
+		}
+		account.health.unavailableUntil =
+			source === "probe"
+				? until
+				: Math.max(account.health.unavailableUntil, until)
+		account.health.unavailableReason = block.reason
+		// Keep an armed timer: repeated observations must not postpone it.
+		if (usageScheduler?.nextProbeAt(account) === undefined)
+			usageScheduler?.scheduleBlocked(account)
+	}
+	const unblockUsage = (account: PoolAccount, source: UsageSource): void => {
+		if (
+			account.usage.blocked &&
+			account.health.unavailableReason === account.usage.blockedReason
+		) {
+			account.health.unavailableUntil = 0
+			account.health.consecutiveFailures = 0
+			account.health.unavailableReason = undefined
+		}
+		account.usage = { blocked: false, observedAt: now(), source }
+		usageScheduler?.cancel(account)
+		notify()
+	}
+	/** A known reset re-admits the account without a probe. */
+	const refreshUsageBlocks = (): void => {
+		for (const account of accounts)
+			if (
+				account.usage.blocked &&
+				account.usage.blockedUntil !== undefined &&
+				account.usage.blockedUntil <= now()
+			) {
+				account.usage = { ...account.usage, blocked: false }
+				usageScheduler?.cancel(account)
+			}
+	}
+	/** Header/event windows at 100% block immediately, without a probe. */
+	const observeUsage = (account: PoolAccount, source: UsageSource): void => {
+		const rate = account.lastRate
+		const credits = account.quota.snapshot(now())?.credits
+		const block = evaluateUsageBlock(
+			{
+				primary:
+					rate?.primaryUsedPercent === undefined
+						? undefined
+						: {
+								usedPercent: rate.primaryUsedPercent,
+								resetAt: rate.primaryResetAt,
+							},
+				secondary:
+					rate?.secondaryUsedPercent === undefined
+						? undefined
+						: {
+								usedPercent: rate.secondaryUsedPercent,
+								resetAt: rate.secondaryResetAt,
+							},
+				credits,
+			},
+			now(),
+		)
+		if (block) blockUsage(account, block, source)
+		else if (rate)
+			account.usage = { ...account.usage, observedAt: now(), source }
+	}
+	const rateFromUsage = (snapshot: CodexUsageSnapshot): CodexRateSnapshot => ({
+		observedAt: snapshot.observedAt,
+		primaryUsedPercent: snapshot.primary?.usedPercent,
+		secondaryUsedPercent: snapshot.secondary?.usedPercent,
+		primaryWindowMinutes: snapshot.primary?.windowMinutes,
+		secondaryWindowMinutes: snapshot.secondary?.windowMinutes,
+		primaryResetAt: snapshot.primary?.resetAt,
+		secondaryResetAt: snapshot.secondary?.resetAt,
+		planType: snapshot.planType,
+	})
+	const probeUsage = async (account: PoolAccount): Promise<void> => {
+		const signal = healthRefreshLifecycle.signal
+		try {
+			if (closed || signal.aborted) return
+			await refreshQuarantines()
+			if (account.quarantineVersion !== undefined) return
+			let session: OpenAIOAuthSession | null
+			try {
+				session = await abortable(account.lockedGetSession(), signal)
+			} catch (error) {
+				if (!signal.aborted) markError(account, error)
+				return
+			}
+			if (!session || closed || signal.aborted) return
+			const codexVersion = await resolveCodexClientVersion({
+				codexVersion: config.codexVersion,
+				fetchImpl: account.probe.versionFetch,
+				signal,
+			}).catch(() => DEFAULT_CODEX_CLIENT_VERSION)
+			const result = await fetchCodexUsage({
+				fetch: account.probe.fetch,
+				url: account.probe.url,
+				session,
+				headers: account.probe.headers,
+				codexVersion,
+				terminalToken: account.probe.terminalToken,
+				signal,
+				now,
+			}).catch(() => undefined)
+			// The credential owner may have changed while the probe was in flight.
+			if (!result || !owns(account, session) || closed || signal.aborted) return
+			if (result.kind === "ok") {
+				for (const update of result.snapshot.updates)
+					account.quota.update(update)
+				account.lastRate = rateFromUsage(result.snapshot)
+				const block = evaluateUsageBlock(result.snapshot, now())
+				if (block) blockUsage(account, block, "probe")
+				else unblockUsage(account, "probe")
+				return
+			}
+			// Only an authentication rejection says anything about the account;
+			// probe throttling, server errors and bad payloads never bench it.
+			if (result.kind === "http" && result.status === 401) {
+				const failure = computeUnavailability({
+					status: result.status,
+					headers: result.headers,
+					bodyText: result.bodyText,
+					consecutiveFailures: account.health.consecutiveFailures,
+					now: now(),
+				})
+				if (!failure) return
+				account.health.consecutiveFailures += 1
+				account.health.unavailableUntil = Math.max(
+					account.health.unavailableUntil,
+					now() + failure.unavailableMs,
+				)
+				account.health.unavailableReason = failure.reason
+			}
+		} finally {
+			if (
+				account.usage.blocked &&
+				usageScheduler?.nextProbeAt(account) === undefined
+			)
+				usageScheduler?.scheduleBlocked(account)
+		}
+	}
+	/** Utilization only falls when its window resets; no time-based staleness. */
+	const utilization = (account: PoolAccount) => {
+		const rate = account.lastRate
+		const at = now()
+		const value = (used?: number, resetAt?: number) =>
+			used === undefined || (resetAt !== undefined && resetAt <= at) ? 0 : used
+		const primary = value(rate?.primaryUsedPercent, rate?.primaryResetAt)
+		const secondary = value(rate?.secondaryUsedPercent, rate?.secondaryResetAt)
+		return { primary, secondary, max: Math.max(primary, secondary) }
+	}
+	const inReserve = (account: PoolAccount): boolean =>
+		reservePercent < 100 && utilization(account).max >= reservePercent
 	const available = (account: PoolAccount): boolean =>
 		account.quarantineVersion === undefined &&
 		isAccountAvailable(account.health, now()) &&
 		account.inflight < maxInflight
-	const pick = (): PoolAccount | undefined => {
+	const pick = (
+		exclude?: ReadonlySet<PoolAccount>,
+	): PoolAccount | undefined => {
 		let best: PoolAccount | undefined
+		let bestKey: number[] = []
 		for (const account of accounts) {
-			if (!available(account)) continue
-			const load = weightedLoad(account.inflight, account.weight)
-			const bestLoad = best
-				? weightedLoad(best.inflight, best.weight)
-				: Infinity
-			if (
-				!best ||
-				load < bestLoad ||
-				(load === bestLoad &&
-					rateSnapshotUtilization(account.lastRate, now()) <
-						rateSnapshotUtilization(best.lastRate, now()))
-			)
+			if (!available(account) || exclude?.has(account)) continue
+			const usage = utilization(account)
+			// Reserve tier first, then weighted load, then weekly then 5h headroom.
+			const key = [
+				inReserve(account) ? 1 : 0,
+				weightedLoad(account.inflight, account.weight),
+				usage.secondary,
+				usage.primary,
+			]
+			const index = key.findIndex((value, at) => value !== bestKey[at])
+			if (!best || (index >= 0 && (key[index] ?? 0) < (bestKey[index] ?? 0))) {
 				best = account
+				bestKey = key
+			}
 		}
 		return best
 	}
 	const acquire = async (
 		prefer?: PoolAccount,
 		signal?: AbortSignal,
+		exclude?: ReadonlySet<PoolAccount>,
 	): Promise<PoolAccount> => {
 		const started = Date.now()
 		for (;;) {
 			if (closed) throw new Error("Pool is closed.")
 			await refreshQuarantines()
+			refreshUsageBlocks()
 			if (signal?.aborted) throw abortReason(signal)
-			const account = prefer ? (available(prefer) ? prefer : undefined) : pick()
+			const account = prefer
+				? available(prefer)
+					? prefer
+					: undefined
+				: pick(exclude)
 			if (account) {
 				account.inflight += 1
 				return account
 			}
+			const candidates = prefer
+				? [prefer]
+				: accounts.filter((item) => !exclude?.has(item))
+			if (candidates.length === 0)
+				throw new PoolCapacityError("No untried pool account remains.")
 			if (waiters.size >= maxQueued)
 				throw new PoolCapacityError("Pool admission queue is full.")
 			const remaining = queueTimeout - (Date.now() - started)
@@ -713,7 +986,7 @@ export const createOpenAIPool = async (
 			// Every candidate is cooling down past the admission budget, so waiting
 			// cannot succeed; fail now and let the caller route elsewhere.
 			const earliest = Math.min(
-				...(prefer ? [prefer] : accounts).map((item) =>
+				...candidates.map((item) =>
 					item.quarantineVersion === undefined
 						? item.health.unavailableUntil - now()
 						: 0,
@@ -739,7 +1012,6 @@ export const createOpenAIPool = async (
 					cleanup()
 					reject(abortReason(signal))
 				}
-				const candidates = prefer ? [prefer] : accounts
 				const cooldowns = candidates
 					.map((item) => item.health.unavailableUntil - now())
 					.filter((delay) => delay > 0)
@@ -856,162 +1128,248 @@ export const createOpenAIPool = async (
 			globalThis.crypto.randomUUID()
 		await refreshQuarantines()
 		const preferred = owner?.account ?? (hash ? affinity.get(hash) : undefined)
-		// Identical-request affinity is only a hint. A response-id owner is binding.
-		const account = await acquire(
-			owner
-				? owner.account
-				: preferred && preferred.inflight === 0 && available(preferred)
-					? preferred
-					: undefined,
-			signal,
-		)
-		let handedOff = false
-		const contextId = globalThis.crypto.randomUUID()
-		let selectedSession: OpenAIOAuthSession | undefined
-		try {
-			const session = await abortable(account.lockedGetSession(), signal)
-			if (!session) throw new Error("OpenAI OAuth session not found.")
-			selectedSession = session
-			if (
-				owner &&
-				(session.accountId !== owner.accountId ||
-					(session.isFedRamp === true) !== owner.isFedRamp)
-			)
-				throw new Error("Continuation credential owner changed.")
-			if (responses) {
-				requestContexts.set(contextId, {
-					owner: {
-						account,
-						accountId: session.accountId,
-						isFedRamp: session.isFedRamp === true,
-						conversation,
-					},
-					explicitConversation: explicitConversation ?? undefined,
-				})
-				headers.set(REQUEST_CONTEXT_HEADER, contextId)
-				headers.set(
-					EXPECTED_ACCOUNT_HEADER,
-					JSON.stringify([session.accountId, session.isFedRamp === true]),
+		type Attempt =
+			| { kind: "done"; response: Response }
+			| { kind: "retry"; response?: Response; error?: unknown }
+		// One dispatch on one account. With `canRetry`, an account-scoped quota or
+		// throttling failure before any output releases the lease and asks the
+		// caller to try another account instead of surfacing the error.
+		const attempt = async (
+			account: PoolAccount,
+			headers: Headers,
+			canRetry: boolean,
+		): Promise<Attempt> => {
+			let handedOff = false
+			const contextId = globalThis.crypto.randomUUID()
+			let selectedSession: OpenAIOAuthSession | undefined
+			try {
+				const session = await abortable(account.lockedGetSession(), signal)
+				if (!session) throw new Error("OpenAI OAuth session not found.")
+				selectedSession = session
+				if (
+					owner &&
+					(session.accountId !== owner.accountId ||
+						(session.isFedRamp === true) !== owner.isFedRamp)
 				)
-				let id = account.conversationIds.get(conversation)
-				if (!id) {
-					id = randomUUIDv7()
-					account.conversationIds.set(conversation, id)
-				}
-				if (config.rotateIdentity === false) id = account.installationId
-				headers.set("session-id", id)
-				headers.set("thread-id", id)
-				headers.set("x-client-request-id", id)
-				headers.set("x-codex-window-id", `${id}:0`)
-				if (explicitTurn) {
-					const state = account.turnStates.get(
-						JSON.stringify([
-							session.accountId,
-							session.isFedRamp === true,
+					throw new Error("Continuation credential owner changed.")
+				if (responses) {
+					requestContexts.set(contextId, {
+						owner: {
+							account,
+							accountId: session.accountId,
+							isFedRamp: session.isFedRamp === true,
 							conversation,
-							explicitTurn,
-						]),
+						},
+						explicitConversation: explicitConversation ?? undefined,
+					})
+					headers.set(REQUEST_CONTEXT_HEADER, contextId)
+					headers.set(
+						EXPECTED_ACCOUNT_HEADER,
+						JSON.stringify([session.accountId, session.isFedRamp === true]),
 					)
-					if (state) headers.set("x-codex-turn-state", state)
-				}
-			}
-			const multipart = headers
-				.get("content-type")
-				?.toLowerCase()
-				.startsWith("multipart/form-data")
-			let outgoingBody: BodyInit | null | undefined = text
-			if (!responses) {
-				if (init?.body instanceof FormData) outgoingBody = init.body
-				else if (multipart)
-					outgoingBody = await abortable(request.formData(), signal)
-				else if (
-					new URL(request.url).pathname.endsWith("/images/generations") &&
-					request.body
-				)
-					outgoingBody = await readBounded(
-						request.body,
-						maxBodyBytes,
-						false,
-						signal,
-					)
-				else outgoingBody = request.body
-			}
-			const response = await abortable(
-				account.transportFetch(request.url, {
-					method: request.method,
-					headers,
-					body: outgoingBody,
-					signal,
-					redirect: request.redirect,
-					...(outgoingBody instanceof ReadableStream ? { duplex: "half" } : {}),
-				}),
-				signal,
-			)
-			if (!responses && owns(account, session) && !signal.aborted) {
-				for (const update of parseCodexQuotaHeaders(response.headers, now()))
-					account.quota.update(update)
-			}
-			if (response.ok && owns(account, session)) {
-				account.health.consecutiveFailures = 0
-				const rate = parseCodexRateHeaders(response.headers, now())
-				if (rate) account.lastRate = rate
-				if (hash) affinity.set(hash, account)
-				if (explicitTurn) {
-					const state = response.headers.get("x-codex-turn-state")
-					if (state)
-						account.turnStates.set(
+					let id = account.conversationIds.get(conversation)
+					if (!id) {
+						id = randomUUIDv7()
+						account.conversationIds.set(conversation, id)
+					}
+					if (config.rotateIdentity === false) id = account.installationId
+					headers.set("session-id", id)
+					headers.set("thread-id", id)
+					headers.set("x-client-request-id", id)
+					headers.set("x-codex-window-id", `${id}:0`)
+					if (explicitTurn) {
+						const state = account.turnStates.get(
 							JSON.stringify([
 								session.accountId,
 								session.isFedRamp === true,
 								conversation,
 								explicitTurn,
 							]),
-							state,
 						)
+						if (state) headers.set("x-codex-turn-state", state)
+					}
 				}
-			} else if (!response.ok) {
-				let errorText: string | undefined
-				const clone = response.clone()
-				if (clone.body)
-					errorText = await abortable(
-						readBounded(clone.body, MAX_ERROR_BODY_BYTES, true, signal),
-						signal,
-					).catch(() => undefined)
-				const failure = computeUnavailability({
-					status: response.status,
-					headers: response.headers,
-					bodyText: errorText,
-					consecutiveFailures: account.health.consecutiveFailures,
-					now: now(),
-				})
-				// Credentials may have changed while awaiting headers or the error body.
-				if (failure && owns(account, session)) {
-					account.health.consecutiveFailures += 1
-					account.health.unavailableUntil = Math.max(
-						account.health.unavailableUntil,
-						now() + failure.unavailableMs,
+				const multipart = headers
+					.get("content-type")
+					?.toLowerCase()
+					.startsWith("multipart/form-data")
+				let outgoingBody: BodyInit | null | undefined = text
+				if (!responses) {
+					if (init?.body instanceof FormData) outgoingBody = init.body
+					else if (multipart)
+						outgoingBody = await abortable(request.formData(), signal)
+					else if (
+						new URL(request.url).pathname.endsWith("/images/generations") &&
+						request.body
 					)
-					account.health.unavailableReason = failure.reason
+						outgoingBody = await readBounded(
+							request.body,
+							maxBodyBytes,
+							false,
+							signal,
+						)
+					else outgoingBody = request.body
 				}
-			}
-			const result = observeResponse(
-				response,
-				() => {
+				const response = await abortable(
+					account.transportFetch(request.url, {
+						method: request.method,
+						headers,
+						body: outgoingBody,
+						signal,
+						redirect: request.redirect,
+						...(outgoingBody instanceof ReadableStream
+							? { duplex: "half" }
+							: {}),
+					}),
+					signal,
+				)
+				if (!responses && owns(account, session) && !signal.aborted) {
+					for (const update of parseCodexQuotaHeaders(response.headers, now()))
+						account.quota.update(update)
+				}
+				if (response.ok && owns(account, session)) {
+					account.health.consecutiveFailures = 0
+					const rate = parseCodexRateHeaders(response.headers, now())
+					if (rate) {
+						account.lastRate = rate
+						observeUsage(account, "headers")
+					}
+					if (hash) affinity.set(hash, account)
+					if (explicitTurn) {
+						const state = response.headers.get("x-codex-turn-state")
+						if (state)
+							account.turnStates.set(
+								JSON.stringify([
+									session.accountId,
+									session.isFedRamp === true,
+									conversation,
+									explicitTurn,
+								]),
+								state,
+							)
+					}
+				} else if (!response.ok) {
+					let errorText: string | undefined
+					const clone = response.clone()
+					if (clone.body)
+						errorText = await abortable(
+							readBounded(clone.body, MAX_ERROR_BODY_BYTES, true, signal),
+							signal,
+						).catch(() => undefined)
+					const failure = computeUnavailability({
+						status: response.status,
+						headers: response.headers,
+						bodyText: errorText,
+						consecutiveFailures: account.health.consecutiveFailures,
+						now: now(),
+					})
+					// Credentials may have changed while awaiting headers or the error body.
+					if (failure && owns(account, session)) {
+						account.health.consecutiveFailures += 1
+						account.health.unavailableUntil = Math.max(
+							account.health.unavailableUntil,
+							now() + failure.unavailableMs,
+						)
+						account.health.unavailableReason = failure.reason
+						const rate = parseCodexRateHeaders(response.headers, now())
+						if (rate) account.lastRate = rate
+						let parsedError: unknown
+						try {
+							parsedError = errorText ? JSON.parse(errorText) : undefined
+						} catch {}
+						const classified = parseInferenceError(parsedError, {
+							status: response.status,
+							headers: response.headers,
+							now: now(),
+						})
+						if (classified.category === "quota")
+							blockUsage(
+								account,
+								{
+									until:
+										classified.retryAt !== undefined &&
+										classified.retryAt > now()
+											? classified.retryAt
+											: undefined,
+									reason: `usage limit reached${classified.code ? ` (${classified.code})` : ""}`,
+								},
+								"response",
+							)
+						else observeUsage(account, "headers")
+					}
+					if (failure?.retriableOnOtherAccount && canRetry && !signal.aborted)
+						return { kind: "retry", response }
+				}
+				const result = observeResponse(
+					response,
+					() => {
+						requestContexts.delete(contextId)
+						release(account)
+					},
+					signal,
+				)
+				handedOff = true
+				return { kind: "done", response: result }
+			} catch (error) {
+				if (!signal.aborted) markError(account, error, selectedSession)
+				if (
+					canRetry &&
+					!signal.aborted &&
+					error instanceof InferenceError &&
+					!error.responseStarted &&
+					(error.category === "quota" || error.category === "throttled")
+				)
+					return { kind: "retry", error }
+				throw error
+			} finally {
+				if (!handedOff) {
 					requestContexts.delete(contextId)
 					release(account)
-				},
-				signal,
-			)
-			handedOff = true
-			return result
-		} catch (error) {
-			if (!signal.aborted) markError(account, error, selectedSession)
-			throw error
-		} finally {
-			if (!handedOff) {
-				requestContexts.delete(contextId)
-				release(account)
+				}
 			}
+		}
+		// A binding owner never fails over; only complete, buffered fresh
+		// Responses requests can be replayed on another account.
+		const fresh = responses && !owner && failoverOnUsageLimit
+		const tried = new Set<PoolAccount>()
+		let pending: Extract<Attempt, { kind: "retry" }> | undefined
+		const surface = (failed: Extract<Attempt, { kind: "retry" }>): Response => {
+			if (failed.response) return failed.response
+			throw failed.error
+		}
+		for (;;) {
+			let account: PoolAccount
+			try {
+				// Identical-request affinity is only a hint. A response-id owner is binding.
+				account = await acquire(
+					owner
+						? owner.account
+						: tried.size === 0 &&
+								preferred &&
+								preferred.inflight === 0 &&
+								available(preferred) &&
+								!inReserve(preferred)
+							? preferred
+							: undefined,
+					signal,
+					tried,
+				)
+			} catch (error) {
+				// No other account can take it now; return the original failure.
+				if (pending && !signal.aborted) return surface(pending)
+				throw error
+			}
+			if (pending?.response)
+				void pending.response.body?.cancel().catch(() => undefined)
+			pending = undefined
+			tried.add(account)
+			const outcome = await attempt(
+				account,
+				new Headers(headers),
+				fresh && tried.size < accounts.length,
+			)
+			if (outcome.kind === "done") return outcome.response
+			pending = outcome
 		}
 	}
 
@@ -1047,6 +1405,16 @@ export const createOpenAIPool = async (
 		;(healthRefreshTimer as unknown as { unref?: () => void }).unref?.()
 	}
 	scheduleHealthRefresh()
+	usageScheduler = new UsageProbeScheduler<PoolAccount>(
+		{
+			startupWindowMs: startupProbeWindowMs,
+			blockedProbeMs,
+			random: config.random,
+			now,
+		},
+		probeUsage,
+	)
+	usageScheduler.start(accounts)
 	const transport: OpenAIOAuthTransport = {
 		kind: "openai-compatible",
 		baseURL: compatibleBase,
@@ -1116,15 +1484,29 @@ export const createOpenAIPool = async (
 				consecutiveFailures: account.health.consecutiveFailures,
 				codex: account.lastRate,
 				quota: account.quota.snapshot(now()),
+				usage: {
+					blocked:
+						account.usage.blocked &&
+						(account.usage.blockedUntil === undefined ||
+							account.usage.blockedUntil > now()),
+					blockedReason: account.usage.blockedReason,
+					blockedUntil: account.usage.blockedUntil,
+					reserve: inReserve(account),
+					nextProbeAt: usageScheduler?.nextProbeAt(account),
+					observedAt: account.usage.observedAt,
+					source: account.usage.source,
+				},
 			})),
 		close: async () => {
 			closed = true
 			stopHealthRefresh()
+			usageScheduler?.stop()
 			notify()
 		},
 		destroy: () => {
 			closed = true
 			stopHealthRefresh()
+			usageScheduler?.stop()
 			lifecycle.abort(new DOMException("Pool destroyed.", "AbortError"))
 			notify()
 			destroying ??= Promise.all(

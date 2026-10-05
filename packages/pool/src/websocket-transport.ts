@@ -1,12 +1,16 @@
 import {
 	buildCodexUserAgent,
+	codexPolicyHeaders,
 	DEFAULT_CODEX_BASE_URL,
 	DEFAULT_CODEX_CLIENT_VERSION,
 	DEFAULT_CODEX_ORIGINATOR,
+	InferenceError,
+	orderCodexRequestFields,
 	parseInferenceError,
 	ResponseSseCollector,
 	resolveCodexClientVersion,
 } from "@openai-oauth/core"
+import { saturatedResetDelay } from "./account-state.js"
 import type { ChatGptCookieJar } from "./cookie-jar.js"
 
 const RESPONSES_WEBSOCKETS_BETA = "responses_websockets=2026-02-06"
@@ -138,11 +142,14 @@ type UndiciModule = {
 
 /** Receives Set-Cookie values from successful and rejected upgrades. */
 type HandshakeCookieObserver = (setCookies: string[]) => void
+/** Receives a rejected upgrade's status and bounded policy/rate headers. */
+type HandshakeRejectionObserver = (status: number, headers: Headers) => void
 
 type WebSocketFactory = (
 	url: string,
 	headers: Record<string, string>,
 	onSetCookies?: HandshakeCookieObserver,
+	onRejected?: HandshakeRejectionObserver,
 ) => Promise<UndiciWebSocket> | UndiciWebSocket
 
 const setCookieValues = (headers: unknown): string[] => {
@@ -168,8 +175,44 @@ const setCookieValues = (headers: unknown): string[] => {
  * dispatcher like codex's connector does (websocket-client lib.rs: store cookies
  * from both successful and rejected upgrades).
  */
+const MAX_HANDSHAKE_HEADERS = 64
+
+/** Retry/rate metadata only; never arbitrary upstream response headers. */
+const handshakePolicyHeaders = (raw: unknown): Headers => {
+	const headers = new Headers()
+	const entries: [string, unknown][] = Array.isArray(raw)
+		? Array.from({ length: Math.floor(raw.length / 2) }, (_, index) => [
+				String(raw[index * 2]),
+				raw[index * 2 + 1],
+			])
+		: isRecord(raw)
+			? Object.entries(raw)
+			: []
+	for (const [name, value] of entries) {
+		if (
+			headers.has(name) ||
+			[...headers.keys()].length >= MAX_HANDSHAKE_HEADERS
+		)
+			continue
+		const key = name.toLowerCase()
+		if (
+			key !== "retry-after" &&
+			key !== "x-request-id" &&
+			!/^x-[a-z0-9-]{1,64}-(?:primary|secondary)-(?:used-percent|window-minutes|reset-at)$/.test(
+				key,
+			) &&
+			!/^x-codex-[a-z0-9-]{1,64}$/.test(key)
+		)
+			continue
+		const text = String(Array.isArray(value) ? value[0] : value)
+		if (text.length > 256 || /[^\x20-\x7e]/.test(text)) continue
+		headers.set(key, text)
+	}
+	return headers
+}
+
 export const observeHandshakeCookies =
-	(observe: HandshakeCookieObserver) =>
+	(observe: HandshakeCookieObserver, onRejected?: HandshakeRejectionObserver) =>
 	(dispatch: UndiciDispatch): UndiciDispatch =>
 	(options, handler) =>
 		dispatch(
@@ -188,6 +231,15 @@ export const observeHandshakeCookies =
 						if (index >= 0) {
 							const cookies = setCookieValues(args[index])
 							if (cookies.length > 0) observe(cookies)
+							const status = args[index - 1]
+							if (
+								onRejected &&
+								typeof status === "number" &&
+								Number.isInteger(status) &&
+								status >= 300 &&
+								status <= 599
+							)
+								onRejected(status, handshakePolicyHeaders(args[index]))
 						}
 						return value.apply(target, args)
 					}
@@ -328,27 +380,6 @@ type PendingExchange = {
 const errorOf = (value: unknown): Error =>
 	value instanceof Error ? value : new Error("Websocket operation failed.")
 
-/** Wrapped errors carry HTTP policy metadata, not arbitrary response headers. */
-const wrappedErrorHeaders = (value: unknown): Headers => {
-	const headers = new Headers()
-	if (!isRecord(value)) return headers
-	for (const [name, raw] of Object.entries(value)) {
-		const key = name.toLowerCase()
-		if (!["retry-after", "x-codex-active-limit", "x-request-id"].includes(key))
-			continue
-		const text =
-			typeof raw === "string"
-				? raw
-				: typeof raw === "number" && Number.isFinite(raw)
-					? String(raw)
-					: undefined
-		if (text === undefined || text.length > 256 || /[^\x20-\x7e]/.test(text))
-			continue
-		headers.set(key, text)
-	}
-	return headers
-}
-
 const semanticKey = (body: JsonRecord): string =>
 	JSON.stringify(
 		Object.fromEntries(
@@ -435,6 +466,36 @@ export class WebsocketConnection {
 		}, WS_IDLE_TIMEOUT_MS)
 	}
 
+	private handshakeError(
+		rejection: { status: number; headers: Headers } | undefined,
+	): Error | undefined {
+		if (!rejection) return undefined
+		const now = this.options.now?.() ?? Date.now()
+		const parsed = parseInferenceError(
+			{},
+			{
+				status: rejection.status,
+				headers: rejection.headers,
+				responseStarted: false,
+				now,
+			},
+		)
+		const resetDelay =
+			rejection.status === 429
+				? saturatedResetDelay(rejection.headers, now)
+				: undefined
+		if (resetDelay === undefined) return parsed
+		return new InferenceError({
+			category: parsed.category,
+			status: parsed.status,
+			code: parsed.code,
+			retryAt: Math.max(parsed.retryAt ?? 0, now + resetDelay),
+			limitId: parsed.limitId,
+			requestId: parsed.requestId,
+			responseStarted: false,
+		})
+	}
+
 	private disconnect(error: Error): void {
 		this.last = undefined
 		if (this.idleTimer) this.timers.clearTimeout(this.idleTimer)
@@ -511,18 +572,20 @@ export class WebsocketConnection {
 				url: string,
 				values: Record<string, string>,
 				onSetCookies?: HandshakeCookieObserver,
+				onRejected?: HandshakeRejectionObserver,
 			) => {
 				const undici = await loadUndici()
 				if (!undici) throw new Error("Websocket transport requires undici.")
 				return new undici.WebSocket(url, {
 					headers: values,
-					...(onSetCookies
-						? {
-								dispatcher: undici
-									.getGlobalDispatcher()
-									.compose(observeHandshakeCookies(onSetCookies)),
-							}
-						: {}),
+					dispatcher: undici
+						.getGlobalDispatcher()
+						.compose(
+							observeHandshakeCookies(
+								onSetCookies ?? (() => undefined),
+								onRejected,
+							),
+						),
 				})
 			})
 		const target = this.identity.url
@@ -539,10 +602,16 @@ export class WebsocketConnection {
 			!Object.keys(headers).some((name) => name.toLowerCase() === "cookie")
 		)
 			headers.Cookie = cookie
+		// codex responses_websocket.rs map_ws_error: a rejected upgrade keeps its
+		// HTTP status and Retry-After so callers can bench the account.
+		let rejection: { status: number; headers: Headers } | undefined
 		const socket = await factory(
 			target.toString(),
 			headers,
 			jar ? (setCookies) => jar.store(target, setCookies) : undefined,
+			(status, rejected) => {
+				rejection = { status, headers: rejected }
+			},
 		)
 		if (this.closed || signal?.aborted) {
 			socket.close()
@@ -570,10 +639,16 @@ export class WebsocketConnection {
 			this.handshakeReject = (error) => finish(error)
 			socket.addEventListener("open", () => finish())
 			socket.addEventListener("error", () =>
-				finish(new Error("Codex websocket handshake failed.")),
+				finish(
+					this.handshakeError(rejection) ??
+						new Error("Codex websocket handshake failed."),
+				),
 			)
 			socket.addEventListener("close", () =>
-				finish(new Error("Codex websocket closed during handshake.")),
+				finish(
+					this.handshakeError(rejection) ??
+						new Error("Codex websocket closed during handshake."),
+				),
 			)
 			signal?.addEventListener("abort", abort, { once: true })
 			if (socket.readyState === 1) finish()
@@ -769,7 +844,7 @@ export class WebsocketConnection {
 				if (type === "error") {
 					this.disconnect(
 						parseInferenceError(event, {
-							headers: wrappedErrorHeaders(event.headers),
+							headers: codexPolicyHeaders(event.headers),
 							responseStarted: started,
 							now: this.options.now?.(),
 						}),
@@ -856,7 +931,7 @@ export class WebsocketConnection {
 		if (identity.signal?.aborted) abort()
 		else
 			try {
-				socket.send(JSON.stringify(frame))
+				socket.send(JSON.stringify(orderCodexRequestFields(frame)))
 			} catch (error) {
 				this.disconnect(errorOf(error))
 			}

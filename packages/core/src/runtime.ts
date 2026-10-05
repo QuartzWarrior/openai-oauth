@@ -962,6 +962,45 @@ export const normalizeCodexResponsesBody = (
 	options: NormalizeCodexResponsesBodyOptions = {},
 ): Record<string, unknown> => normalizeCodexResponsesBodyInternal(body, options)
 
+// Declaration order of codex-api ResponsesApiRequest / ResponseCreateWsRequest.
+const CODEX_REQUEST_FIELD_ORDER = [
+	"model",
+	"stream",
+	"service_tier",
+	"instructions",
+	"previous_response_id",
+	"input",
+	"tools",
+	"tool_choice",
+	"parallel_tool_calls",
+	"reasoning",
+	"store",
+	"stream_options",
+	"include",
+	"prompt_cache_key",
+	"text",
+	"generate",
+	"client_metadata",
+	"access_programs",
+] as const
+
+/**
+ * Serialize fields in codex's declaration order. Routing fields come first so
+ * gateways can inspect them before a potentially multi-megabyte input
+ * (codex-api common.rs). Caller-only fields follow in their original order.
+ */
+export const orderCodexRequestFields = <T extends Record<string, unknown>>(
+	body: T,
+): T => {
+	const ordered: Record<string, unknown> = {}
+	if (Object.hasOwn(body, "type")) ordered.type = body.type
+	for (const key of CODEX_REQUEST_FIELD_ORDER)
+		if (Object.hasOwn(body, key)) ordered[key] = body[key]
+	for (const [key, value] of Object.entries(body))
+		if (!Object.hasOwn(ordered, key)) ordered[key] = value
+	return ordered as T
+}
+
 type PreparedResponsesRequestBody = {
 	body: BodyInit | null | undefined
 	requestBody?: Record<string, unknown>
@@ -1115,7 +1154,9 @@ const prepareResponsesRequestBody = async (
 		// Captures advance synchronously with consumer reads. Never wait for all
 		// other active streams on this owner merely to resolve one predecessor.
 		validateStateReferences(normalized)
-		const expanded = state?.expandRequestBody(normalized) ?? normalized
+		const expanded = orderCodexRequestFields(
+			state?.expandRequestBody(normalized) ?? normalized,
+		)
 
 		return {
 			body: JSON.stringify(expanded),
@@ -1280,7 +1321,7 @@ const finalizeResponsesResponse = async (
 	})
 }
 
-const applyAuthHeaders = (
+export const applyCodexAuthHeaders = (
 	headers: Headers,
 	auth: OpenAIOAuthSession,
 	codexVersion?: string,
@@ -1373,7 +1414,12 @@ const createModelCatalogResolver = (
 						new Headers(init?.headers).forEach((value, key) => {
 							headers.set(key, value)
 						})
-						applyAuthHeaders(headers, auth, version, settings.terminalToken)
+						applyCodexAuthHeaders(
+							headers,
+							auth,
+							version,
+							settings.terminalToken,
+						)
 						const response = await fetch(resolveTargetUrl(path, baseURL), {
 							...init,
 							method: init?.method ?? "GET",
@@ -1606,7 +1652,7 @@ const createCodexOAuthFetch = (
 			// terminalToken) instead of the build-frozen DEFAULT_CODEX_USER_AGENT —
 			// which would otherwise drop terminalToken on the fallback path.
 			await waitWithSignal(Promise.resolve(userAgentResolution), signal)
-			applyAuthHeaders(
+			applyCodexAuthHeaders(
 				headers,
 				auth,
 				resolvedCodexVersion,

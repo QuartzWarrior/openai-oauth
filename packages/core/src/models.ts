@@ -6,7 +6,7 @@ import {
 } from "./stream-utils.js"
 import { isRecord } from "./utils.js"
 
-export const DEFAULT_CODEX_CLIENT_VERSION = "0.159.0"
+export const DEFAULT_CODEX_CLIENT_VERSION = "0.160.0"
 
 const CODEX_VERSION_CACHE_TTL_MS = 60 * 60 * 1000
 const CODEX_REGISTRY_URL = "https://registry.npmjs.org/@openai/codex/latest"
